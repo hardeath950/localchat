@@ -1,0 +1,8 @@
+# Build com o toolchain GNU do MSYS2 (nao depende da MSVC).
+# CRT estatico => binario avulso, sem DLLs do mingw na maquina de destino.
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:/msys64/mingw64/bin/gcc.exe"
+rustflags = ["-C", "target-feature=+crt-static"]
