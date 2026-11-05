@@ -151,12 +151,16 @@ impl GuiApp {
         let ctx = self.ctx.clone();
         let tx = self.ctx.notify.clone();
         self.rt.spawn(async move {
-            if let Err(e) = crate::session::send_chat(&addr, &ctx, &text).await {
-                if let Some(tx) = tx {
-                    let _ = tx.send(Event::Notice {
+            let res = crate::session::send_chat(&addr, &ctx, &text).await;
+            if let Some(tx) = tx {
+                let _ = tx.send(match res {
+                    Ok(_) => Event::Notice {
+                        text: format!("mensagem entregue para {name}"),
+                    },
+                    Err(e) => Event::Notice {
                         text: format!("falha ao enviar para {name}: {e:#}"),
-                    });
-                }
+                    },
+                });
             }
         });
     }
