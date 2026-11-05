@@ -3,6 +3,7 @@ use crate::identity::{fingerprint, load_or_init};
 use crate::session::{Ctx, Event};
 use anyhow::{Context as _, Result};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,6 +14,77 @@ enum Line {
     From(String, String),
     Mine(String),
     Notice(String),
+}
+
+/// Linha do historico persistido (JSONL em ~/.localchat/history.jsonl).
+#[derive(Serialize, Deserialize)]
+struct HEntry {
+    t: u64,
+    k: String,
+    who: String,
+    text: String,
+}
+
+fn history_path() -> PathBuf {
+    crate::identity::config_dir().join("history.jsonl")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_history() -> Vec<Line> {
+    let Ok(content) = std::fs::read_to_string(history_path()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for l in content.lines() {
+        let Ok(e) = serde_json::from_str::<HEntry>(l) else {
+            continue;
+        };
+        out.push(match e.k.as_str() {
+            "from" => Line::From(e.who, e.text),
+            "mine" => Line::Mine(e.text),
+            _ => Line::Notice(e.text),
+        });
+    }
+    const MAX: usize = 1000;
+    let skip = out.len().saturating_sub(MAX);
+    out.split_off(skip)
+}
+
+fn persist(line: &Line) {
+    let e = match line {
+        Line::From(who, text) => HEntry {
+            t: now_secs(),
+            k: "from".into(),
+            who: who.clone(),
+            text: text.clone(),
+        },
+        Line::Mine(text) => HEntry {
+            t: now_secs(),
+            k: "mine".into(),
+            who: String::new(),
+            text: text.clone(),
+        },
+        Line::Notice(text) => HEntry {
+            t: now_secs(),
+            k: "notice".into(),
+            who: String::new(),
+            text: text.clone(),
+        },
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path())
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", serde_json::to_string(&e).unwrap_or_default());
+    }
 }
 
 struct GuiApp {
@@ -101,10 +173,14 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         table,
         events: rx,
         input: String::new(),
-        log: vec![Line::Notice(format!(
-            "Bem-vindo ao LocalChat! Voce e '{}'. Selecione um par na lista ao lado.",
-            id.name
-        ))],
+        log: {
+            let mut log = load_history();
+            log.push(Line::Notice(format!(
+                "Bem-vindo ao LocalChat! Voce e '{}'. Selecione um par na lista ao lado.",
+                id.name
+            )));
+            log
+        },
         selected: None,
         status: "pronto".into(),
         me: id.name.clone(),
@@ -124,6 +200,11 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
 }
 
 impl GuiApp {
+    fn log_line(&mut self, line: Line) {
+        persist(&line);
+        self.log.push(line);
+    }
+
     fn peer_addr(&self, name: &str) -> Option<String> {
         let t = self.table.lock().unwrap();
         t.values()
@@ -144,7 +225,7 @@ impl GuiApp {
             self.status = format!("'{name}' saiu da rede");
             return;
         };
-        self.log.push(Line::Mine(text.clone()));
+        self.log_line(Line::Mine(text.clone()));
         self.input.clear();
         self.status = format!("enviando para {name}...");
 
@@ -185,7 +266,7 @@ impl GuiApp {
             .and_then(|s| s.to_str())
             .unwrap_or("arquivo")
             .to_string();
-        self.log.push(Line::Mine(format!("[arquivo] {label}")));
+        self.log_line(Line::Mine(format!("[arquivo] {label}")));
         self.status = format!("enviando {label} para {name}...");
 
         let ctx = self.ctx.clone();
@@ -213,16 +294,16 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(ev) = self.events.try_recv() {
             match ev {
-                Event::Chat { from, text } => self.log.push(Line::From(from, text)),
+                Event::Chat { from, text } => self.log_line(Line::From(from, text)),
                 Event::FileReceived { from, path, size } => {
                     let kb = size / 1024;
-                    self.log.push(Line::Notice(format!(
+                    self.log_line(Line::Notice(format!(
                         "{from} enviou um arquivo ({kb} KiB): {path}"
                     )));
                 }
                 Event::Notice { text } => {
                     self.status = text.clone();
-                    self.log.push(Line::Notice(text));
+                    self.log_line(Line::Notice(text));
                 }
             }
         }
@@ -233,10 +314,16 @@ impl eframe::App for GuiApp {
             .show(ui, |ui| {
                 ui.heading("Na rede");
                 ui.separator();
-                let mut peers: Vec<(String, String)> = {
+                let mut peers: Vec<(String, String, String)> = {
                     let t = self.table.lock().unwrap();
                     t.values()
-                        .map(|p| (p.name.clone(), format!("{}:{}", p.ip, p.port)))
+                        .map(|p| {
+                            (
+                                p.name.clone(),
+                                format!("{}:{}", p.ip, p.port),
+                                crate::identity::pairing_code(&self.fp, &p.fp),
+                            )
+                        })
                         .collect()
                 };
                 peers.sort();
@@ -247,12 +334,13 @@ impl eframe::App for GuiApp {
                             .weak(),
                     );
                 }
-                for (name, addr) in peers {
+                for (name, addr, code) in peers {
                     let selected = self.selected.as_deref() == Some(name.as_str());
                     if ui.selectable_label(selected, &name).clicked() {
                         self.selected = Some(name.clone());
                         self.status = format!("conversando com {name} ({addr})");
                     }
+                    ui.label(egui::RichText::new(format!("codigo {code}")).weak().small());
                 }
                 ui.separator();
                 ui.label(egui::RichText::new(format!("voce: {}", self.me)).weak());

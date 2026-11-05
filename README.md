@@ -70,6 +70,10 @@ A descoberta usa UDP 47820 e o trafego TCP 47821.
 - Criptografia e autenticacao por sessao Noise XX — sem metadados em claro na rede.
 - Identidade persistente por maquina; fingerprint para conferencia manual
   (`localchat init` mostra o seu; compare por telefone na primeira conexao, opcional).
+- **Codigo de pareamento de 6 digitos**: derivado dos dois fingerprints, os dois
+  aparelhos mostram o mesmo numero — basta conferir os digitos, nao o fingerprint.
+  Aparece no primeiro contato e ao lado de cada par na lista. Se um invasor estiver
+  no meio, os codigos aparecem diferentes nos dois lados.
 - Nome duplicado com chave diferente e recusado. Gerenciar com `localchat trust --list` /
   `localchat trust --forget <fingerprint>`.
 - SHA-256 conferido no recebimento; arquivo corrompido nao e confirmado.
@@ -77,12 +81,12 @@ A descoberta usa UDP 47820 e o trafego TCP 47821.
 ## Limitacoes v0
 
 - Recebimento de arquivo e automatico (`--no-auto-accept` recusa tudo).
-- Sem historico persistente de conversas (mensagens aparecem no console).
+- Historico de conversas vale para a GUI (`~/.localchat/history.jsonl`, ultimas 1000 linhas); a CLI e so console.
 - Sem retomada de transferencia interrompida.
 
 ## Roadmap
 
-- GUI leve (system tray + janela) para uso familiar.
-- Emparelhamento por codigo curto (PAKE) em vez de conferencia de fingerprint.
-- Historico de conversas local (SQLite) e multiplas transferencias paralelas.
+- System tray e inicializar com o Windows.
+- Pareamento com aprovacao explicita (gating) e codigo via PAKE para redes hostis.
+- Multiplas transferencias paralelas e progresso por arquivo.
 - Empacotamento em instalador (MSI) e release para Windows/Linux.
