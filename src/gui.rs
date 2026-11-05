@@ -52,7 +52,8 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         .build()?;
 
     let table: PeerTable = Arc::new(Mutex::new(HashMap::new()));
-    let udp = Arc::new(discovery::bind_udp(crate::protocol::DISCOVERY_PORT)?);
+    // from_std precisa do contexto do runtime: fazer o bind dentro dele
+    let udp = Arc::new(rt.block_on(async { discovery::bind_udp(crate::protocol::DISCOVERY_PORT) })?);
     rt.spawn(discovery::announce_loop(
         udp.clone(),
         id.name.clone(),
