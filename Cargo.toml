@@ -20,6 +20,10 @@ socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["full"] }
 tray-icon = "0.26.1"
 
+# no Linux o seletor de arquivos usa GTK (o backend xdg-portal e fragil no sync)
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.17", features = ["gtk3"] }
+
 [profile.release]
 lto = "thin"
 
