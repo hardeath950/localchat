@@ -19,6 +19,8 @@ pub enum Event {
     Notice { text: String },
     /// Par novo pedindo conexao: a UI responde com Confiar/Recusar.
     ApprovalRequest { id: u64, name: String, code: String },
+    /// Progresso de transferencia de arquivo.
+    Progress { name: String, done: u64, total: u64 },
     /// Clique no icone da bandeja ou menu "Abrir".
     GuiShow,
     /// Menu "Sair" da bandeja.
@@ -201,7 +203,7 @@ pub async fn send_chat(addr: &str, ctx: &Ctx, text: &str) -> Result<String> {
 
 pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path) -> Result<String> {
     let (mut chan, remote) = connect(addr, ctx).await?;
-    send_file_over_channel(&mut chan, path).await?;
+    send_file_over_channel(&mut chan, path, ctx).await?;
     graceful_bye(&mut chan).await;
     Ok(remote)
 }
@@ -216,7 +218,26 @@ async fn graceful_bye(chan: &mut SecureChannel<TcpStream>) {
     let _ = chan.shutdown().await;
 }
 
-async fn send_file_over_channel(chan: &mut SecureChannel<TcpStream>, path: &Path) -> Result<()> {
+/// SHA-256 de um arquivo (leitura em streaming).
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+async fn send_file_over_channel(
+    chan: &mut SecureChannel<TcpStream>,
+    path: &Path,
+    ctx: &Ctx,
+) -> Result<()> {
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
         bail!("nao e um arquivo: {}", path.display());
@@ -231,32 +252,70 @@ async fn send_file_over_channel(chan: &mut SecureChannel<TcpStream>, path: &Path
     rand::thread_rng().fill_bytes(&mut id16);
     let file_id = hex::encode(id16);
 
+    // hash primeiro: o destino recebe o hash do arquivo INTEIRO, o que
+    // permite validar tambem o pedaco retomado de uma tentativa anterior
+    let sha256 = hash_file(path).await?;
+
     chan.send_control(&Control::FileOffer {
         file_id: file_id.clone(),
-        name,
+        name: name.clone(),
         size,
     })
     .await?;
-    match chan.recv().await? {
-        Msg::Control(Control::FileAccept { .. }) => {}
+    let offset = match chan.recv().await? {
+        Msg::Control(Control::FileAccept {
+            file_id: fid,
+            offset,
+        }) => {
+            if fid != file_id {
+                bail!("FileAccept de outro arquivo");
+            }
+            if offset > size || offset % CHUNK_SIZE as u64 != 0 {
+                bail!("offset de retomada invalido: {offset}");
+            }
+            offset
+        }
         Msg::Control(Control::FileReject { reason, .. }) => bail!("recusado pelo par: {reason}"),
         _ => bail!("resposta inesperada ao FileOffer"),
-    }
+    };
 
     let mut file = File::open(path).await?;
-    let mut hasher = Sha256::new();
+    if offset > 0 {
+        use tokio::io::{AsyncSeekExt, SeekFrom};
+        file.seek(SeekFrom::Start(offset)).await?;
+        let pct = offset * 100 / size.max(1);
+        let msg = format!("retomando envio de '{name}' a partir de {pct}%");
+        println!("{msg}");
+        ctx.emit(Event::Notice { text: msg });
+    }
+
     let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut seq: u32 = 0;
+    let mut seq: u32 = (offset / CHUNK_SIZE as u64) as u32;
+    let mut sent = offset;
+    let mut since_progress = 0u32;
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
         chan.send_chunk(&id16, seq, &buf[..n]).await?;
         seq += 1;
+        sent += n as u64;
+        since_progress += 1;
+        if since_progress >= 16 {
+            since_progress = 0;
+            ctx.emit(Event::Progress {
+                name: name.clone(),
+                done: sent,
+                total: size,
+            });
+        }
     }
-    let sha256 = hex::encode(hasher.finalize());
+    ctx.emit(Event::Progress {
+        name: name.clone(),
+        done: size,
+        total: size,
+    });
     chan.send_control(&Control::FileDone {
         file_id: file_id.clone(),
         sha256,
@@ -289,18 +348,42 @@ async fn receive_file(
         return Ok(());
     }
     std::fs::create_dir_all(&ctx.download_dir)?;
-    let path = unique_path(&ctx.download_dir, &sanitize(name));
+    let safe = sanitize(name);
+    let part_path = ctx.download_dir.join(format!("{safe}.part"));
+
+    // retomada: se existe .part parcial menor que o arquivo, continua de la
+    let mut offset: u64 = 0;
+    if let Ok(meta) = tokio::fs::metadata(&part_path).await {
+        let s = meta.len();
+        if s > 0 && s < size {
+            offset = s - (s % CHUNK_SIZE as u64);
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&part_path)
+                .await?
+                .set_len(offset)
+                .await?;
+            let pct = offset * 100 / size.max(1);
+            let msg = format!("retomando recebimento de '{name}' a partir de {pct}%");
+            println!("[{remote}] {msg}");
+            ctx.emit(Event::Notice { text: msg });
+        }
+    }
+
     chan.send_control(&Control::FileAccept {
         file_id: file_id.to_string(),
+        offset,
     })
     .await?;
 
-    let mut file = File::create(&path)
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path)
         .await
-        .with_context(|| format!("criar {}", path.display()))?;
-    let mut hasher = Sha256::new();
+        .with_context(|| format!("abrir {}", part_path.display()))?;
     let mut received: u64 = 0;
-    let mut expected: u32 = 0;
+    let mut expected: u32 = (offset / CHUNK_SIZE as u64) as u32;
     let want_id = hex::decode(file_id).unwrap_or_default();
 
     loop {
@@ -313,9 +396,15 @@ async fn receive_file(
                     bail!("ordem de chunk quebrada: {seq} != {expected}");
                 }
                 file.write_all(&data).await?;
-                hasher.update(&data);
                 received += data.len() as u64;
                 expected += 1;
+                if expected % 16 == 0 {
+                    ctx.emit(Event::Progress {
+                        name: name.to_string(),
+                        done: offset + received,
+                        total: size,
+                    });
+                }
             }
             Msg::Control(Control::FileDone { file_id: fid, sha256 }) => {
                 if fid != file_id {
@@ -323,10 +412,11 @@ async fn receive_file(
                 }
                 file.flush().await?;
                 drop(file);
-                let got = hex::encode(hasher.finalize());
-                if received != size || got != sha256 {
+                if offset + received != size {
                     let note = format!(
-                        "integridade falhou: {received}/{size} bytes, sha256 {got} != {sha256}"
+                        "integridade falhou: {}/{} bytes recebidos",
+                        offset + received,
+                        size
                     );
                     chan.send_control(&Control::FileAck {
                         file_id: fid,
@@ -336,6 +426,20 @@ async fn receive_file(
                     .await?;
                     bail!(note);
                 }
+                // hash do arquivo COMPLETO (inclui o pedaco retomado)
+                let got = hash_file(&part_path).await?;
+                if got != sha256 {
+                    let note = format!("integridade falhou: sha256 {got} != {sha256}");
+                    chan.send_control(&Control::FileAck {
+                        file_id: fid,
+                        ok: false,
+                        note: note.clone(),
+                    })
+                    .await?;
+                    bail!(note);
+                }
+                let path = unique_path(&ctx.download_dir, &safe);
+                tokio::fs::rename(&part_path, &path).await?;
                 chan.send_control(&Control::FileAck {
                     file_id: file_id.to_string(),
                     ok: true,
@@ -346,12 +450,12 @@ async fn receive_file(
                     "[{}] arquivo recebido: {} ({} bytes)",
                     remote,
                     path.display(),
-                    received
+                    size
                 );
                 ctx.emit(Event::FileReceived {
                     from: remote.to_string(),
                     path: path.display().to_string(),
-                    size: received,
+                    size,
                 });
                 return Ok(());
             }

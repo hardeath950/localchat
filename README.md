@@ -100,12 +100,13 @@ A descoberta usa UDP 47820 e o trafego TCP 47821.
 ## Limitacoes v0
 
 - Recebimento de arquivo e automatico (`--no-auto-accept` recusa tudo).
+- Transferencias interrompidas sao retomadas automaticamente (`.part`); progresso
+  aparece na barra de status da GUI.
 - Historico de conversas vale para a GUI (`~/.localchat/history.jsonl`, ultimas 1000 linhas); a CLI e so console.
-- Sem retomada de transferencia interrompida.
 
 ## Roadmap
 
 - System tray e inicializar com o Windows.
 - Pareamento com aprovacao explicita (gating) e codigo via PAKE para redes hostis.
-- Multiplas transferencias paralelas e progresso por arquivo.
+- Multiplas transferencias paralelas.
 - Empacotamento em instalador (MSI) e release para Windows/Linux.

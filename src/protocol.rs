@@ -28,6 +28,8 @@ pub enum Control {
     },
     FileAccept {
         file_id: String,
+        /// Retomada: a partir de qual byte o destino quer receber (0 = inicio).
+        offset: u64,
     },
     FileReject {
         file_id: String,

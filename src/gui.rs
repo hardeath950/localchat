@@ -439,6 +439,10 @@ impl eframe::App for GuiApp {
                     self.approvals_ui.push_back((id, name, code));
                     show_from_anywhere();
                 }
+                Event::Progress { name, done, total } => {
+                    let pct = if total > 0 { done * 100 / total } else { 100 };
+                    self.status = format!("{name} — {pct}%");
+                }
                 Event::GuiShow => {
                     self.show_window(ctx);
                 }
