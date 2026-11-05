@@ -101,6 +101,7 @@ struct GuiApp {
     download_dir: PathBuf,
     _tray: tray_icon::TrayIcon,
     quit: bool,
+    approvals_ui: std::collections::VecDeque<(u64, String, String)>,
 }
 
 /// Icone da bandeja: balao de chat azul com tres pontinhos.
@@ -228,6 +229,7 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         download_dir: download_dir.clone(),
         auto_accept: true,
         notify: Some(tx.clone()),
+        approvals: Default::default(),
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -302,6 +304,7 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         download_dir,
         _tray: tray,
         quit: false,
+        approvals_ui: std::collections::VecDeque::new(),
     };
 
     let options = eframe::NativeOptions {
@@ -432,6 +435,10 @@ impl eframe::App for GuiApp {
                     self.status = text.clone();
                     self.log_line(Line::Notice(text));
                 }
+                Event::ApprovalRequest { id, name, code } => {
+                    self.approvals_ui.push_back((id, name, code));
+                    show_from_anywhere();
+                }
                 Event::GuiShow => {
                     self.show_window(ctx);
                 }
@@ -513,6 +520,36 @@ impl eframe::App for GuiApp {
                 });
             });
         });
+
+        // aprovacao de par novo: so confia depois do "Confiar"
+        if let Some((id, name, code)) = self.approvals_ui.front().cloned() {
+            egui::Window::new("Novo par quer conectar")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -60.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!("'{name}' quer conversar com voce."));
+                    ui.add_space(6.0);
+                    ui.label(format!("Codigo de pareamento: {code}"));
+                    ui.label(
+                        egui::RichText::new(
+                            "Confira se o mesmo codigo aparece no aparelho dele antes de confiar.",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Confiar").clicked() {
+                            self.ctx.respond_approval(id, true);
+                            self.approvals_ui.pop_front();
+                        }
+                        if ui.button("Recusar").clicked() {
+                            self.ctx.respond_approval(id, false);
+                            self.approvals_ui.pop_front();
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()

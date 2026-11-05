@@ -107,11 +107,10 @@ pub fn save_trust(store: &TrustStore) -> Result<()> {
     Ok(())
 }
 
-/// TOFU: aceita a chave do par na primeira vez que aparece.
-/// Recusa se o nome ja existia gravado com outra chave (possivel sequestro de nome).
-/// Ok(true) = primeiro contato com esta chave.
-pub fn trust_check(fp: &str, name: &str) -> std::result::Result<bool, String> {
-    let mut store = load_trust();
+/// Consulta sem gravar: Ok(true) = primeira vez com esta chave (par novo).
+/// Err = nome ja existe com outra chave (possivel sequestro).
+pub fn trust_status(fp: &str, name: &str) -> std::result::Result<bool, String> {
+    let store = load_trust();
     for (k, e) in store.peers.iter() {
         if e.name.eq_ignore_ascii_case(name) && k != fp {
             return Err(format!(
@@ -120,7 +119,12 @@ pub fn trust_check(fp: &str, name: &str) -> std::result::Result<bool, String> {
             ));
         }
     }
-    let is_new = !store.peers.contains_key(fp);
+    Ok(!store.peers.contains_key(fp))
+}
+
+/// Grava (ou atualiza) o par como confiavel.
+pub fn trust_save(fp: &str, name: &str) {
+    let mut store = load_trust();
     store.peers.insert(
         fp.to_string(),
         TrustEntry {
@@ -129,6 +133,12 @@ pub fn trust_check(fp: &str, name: &str) -> std::result::Result<bool, String> {
         },
     );
     let _ = save_trust(&store);
+}
+
+/// TOFU direto (CLI/envio iniciado pelo usuario): consulta e grava de uma vez.
+pub fn trust_check(fp: &str, name: &str) -> std::result::Result<bool, String> {
+    let is_new = trust_status(fp, name)?;
+    trust_save(fp, name);
     Ok(is_new)
 }
 

@@ -91,6 +91,8 @@ A descoberta usa UDP 47820 e o trafego TCP 47821.
   aparelhos mostram o mesmo numero — basta conferir os digitos, nao o fingerprint.
   Aparece no primeiro contato e ao lado de cada par na lista. Se um invasor estiver
   no meio, os codigos aparecem diferentes nos dois lados.
+- Primeiro contato pede aprovacao explicita na janela ("Confiar / Recusar") com o
+  codigo de pareamento; nada do par novo e entregue antes disso.
 - Nome duplicado com chave diferente e recusado. Gerenciar com `localchat trust --list` /
   `localchat trust --forget <fingerprint>`.
 - SHA-256 conferido no recebimento; arquivo corrompido nao e confirmado.

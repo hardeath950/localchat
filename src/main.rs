@@ -176,6 +176,7 @@ fn one_shot_ctx() -> Result<Ctx> {
         download_dir: PathBuf::new(),
         auto_accept: true,
         notify: None,
+        approvals: Default::default(),
     })
 }
 
@@ -197,6 +198,7 @@ async fn run_serve(
         download_dir: download_dir.clone(),
         auto_accept: !no_auto_accept,
         notify: None,
+        approvals: Default::default(),
     });
 
     let table: PeerTable = Arc::new(Mutex::new(HashMap::new()));

@@ -4,7 +4,9 @@ use crate::protocol::{Control, CHUNK_SIZE};
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -15,10 +17,33 @@ pub enum Event {
     Chat { from: String, text: String },
     FileReceived { from: String, path: String, size: u64 },
     Notice { text: String },
+    /// Par novo pedindo conexao: a UI responde com Confiar/Recusar.
+    ApprovalRequest { id: u64, name: String, code: String },
     /// Clique no icone da bandeja ou menu "Abrir".
     GuiShow,
     /// Menu "Sair" da bandeja.
     GuiQuit,
+}
+
+/// Fila de aprovacoes pendentes: a UI decide "Confiar / Recusar" cada par novo.
+#[derive(Default)]
+pub struct ApprovalGate {
+    seq: std::sync::atomic::AtomicU64,
+    pending: std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<bool>>>,
+}
+
+impl ApprovalGate {
+    pub fn open(&self, tx: tokio::sync::oneshot::Sender<bool>) -> u64 {
+        let id = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending.lock().unwrap().insert(id, tx);
+        id
+    }
+
+    pub fn respond(&self, id: u64, ok: bool) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(ok);
+        }
+    }
 }
 
 pub struct Ctx {
@@ -28,6 +53,7 @@ pub struct Ctx {
     pub download_dir: PathBuf,
     pub auto_accept: bool,
     pub notify: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    pub approvals: Arc<ApprovalGate>,
 }
 
 impl Ctx {
@@ -39,6 +65,32 @@ impl Ctx {
         if let Some(tx) = &self.notify {
             let _ = tx.send(ev);
         }
+    }
+
+    /// Pede aprovacao para um par novo. Sem UI (CLI) aprova sozinho.
+    /// Aguarda ate 5 minutos; a resposta vem de `respond_approval`.
+    pub async fn request_approval(&self, name: &str, code: &str) -> bool {
+        let Some(tx) = &self.notify else {
+            return true;
+        };
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        let id = self.approvals.open(otx);
+        let _ = tx.send(Event::ApprovalRequest {
+            id,
+            name: name.to_string(),
+            code: code.to_string(),
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(300), orx).await {
+            Ok(Ok(v)) => v,
+            _ => {
+                self.approvals.respond(id, false);
+                false
+            }
+        }
+    }
+
+    pub fn respond_approval(&self, id: u64, ok: bool) {
+        self.approvals.respond(id, ok);
     }
 }
 
@@ -91,15 +143,29 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
     if remote_fp != chan.remote_fingerprint() {
         bail!("seguranca: o par declarou fingerprint diferente do handshake");
     }
-    let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    let is_new = crate::identity::trust_status(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
     if is_new {
-        let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
         let msg = format!(
-            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com a tela do outro aparelho)"
+            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com o outro aparelho)"
         );
         println!("{msg}");
         ctx.emit(Event::Notice { text: msg });
+        // aprovacao explicita: a UI (ou o timeout) decide
+        if !ctx.request_approval(&remote_name, &code).await {
+            let _ = chan
+                .send_control(&Control::Bye {
+                    reason: "par nao confiado".into(),
+                })
+                .await;
+            println!("conexao com '{remote_name}' recusada");
+            ctx.emit(Event::Notice {
+                text: format!("voce recusou o par '{remote_name}'"),
+            });
+            return Ok(());
+        }
     }
+    crate::identity::trust_save(&remote_fp, &remote_name);
 
     loop {
         let msg = match chan.recv_opt().await? {
