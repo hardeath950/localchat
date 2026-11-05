@@ -9,17 +9,32 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Eventos que saem das conexoes para consumo da interface.
+#[derive(Debug, Clone)]
+pub enum Event {
+    Chat { from: String, text: String },
+    FileReceived { from: String, path: String, size: u64 },
+    Notice { text: String },
+}
+
 pub struct Ctx {
     pub name: String,
     pub private: Vec<u8>,
     pub public: Vec<u8>,
     pub download_dir: PathBuf,
     pub auto_accept: bool,
+    pub notify: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
 }
 
 impl Ctx {
     pub fn fp(&self) -> String {
         fingerprint(&self.public)
+    }
+
+    pub fn emit(&self, ev: Event) {
+        if let Some(tx) = &self.notify {
+            let _ = tx.send(ev);
+        }
     }
 }
 
@@ -74,6 +89,10 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
         match msg {
             Msg::Control(Control::Chat { text }) => {
                 println!("[{}] {}", remote_name, text);
+                ctx.emit(Event::Chat {
+                    from: remote_name.clone(),
+                    text,
+                });
             }
             Msg::Control(Control::FileOffer { file_id, name, size }) => {
                 receive_file(&mut chan, &file_id, &name, size, &ctx, &remote_name).await?;
@@ -243,6 +262,11 @@ async fn receive_file(
                     path.display(),
                     received
                 );
+                ctx.emit(Event::FileReceived {
+                    from: remote.to_string(),
+                    path: path.display().to_string(),
+                    size: received,
+                });
                 return Ok(());
             }
             other => bail!("frame inesperado durante transferencia: {:?}", debug_msg(&other)),

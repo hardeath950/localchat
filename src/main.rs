@@ -1,5 +1,6 @@
 mod channel;
 mod discovery;
+mod gui;
 mod identity;
 mod protocol;
 mod session;
@@ -62,6 +63,13 @@ enum Cmd {
         alvo: String,
         arquivo: PathBuf,
     },
+    /// Abre a interface grafica (janela) — recomendado para o dia a dia
+    Gui {
+        #[arg(long, default_value = "0.0.0.0:47821")]
+        listen: String,
+        #[arg(long)]
+        download_dir: Option<PathBuf>,
+    },
     /// Lista ou esquece chaves confiadas (TOFU)
     Trust {
         #[arg(long)]
@@ -71,10 +79,24 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Gui {
+            listen,
+            download_dir,
+        } => gui::run(listen, download_dir),
+        cmd => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_cmd(cmd))
+        }
+    }
+}
+
+async fn run_cmd(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Init { name } => {
             let (id, _priv, pubk) = load_or_init(name)?;
             println!("Nome: {}", id.name);
@@ -139,6 +161,7 @@ async fn main() -> Result<()> {
             no_auto_accept,
             no_discovery,
         } => run_serve(listen, download_dir, no_auto_accept, no_discovery).await,
+        Cmd::Gui { .. } => unreachable!(),
     }
 }
 
@@ -150,6 +173,7 @@ fn one_shot_ctx() -> Result<Ctx> {
         public,
         download_dir: PathBuf::new(),
         auto_accept: true,
+        notify: None,
     })
 }
 
@@ -170,6 +194,7 @@ async fn run_serve(
         public,
         download_dir: download_dir.clone(),
         auto_accept: !no_auto_accept,
+        notify: None,
     });
 
     let table: PeerTable = Arc::new(Mutex::new(HashMap::new()));

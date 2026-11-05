@@ -24,6 +24,18 @@ cargo build --release
 
 ## Uso
 
+### Interface grafica (recomendado)
+
+```bash
+localchat gui
+```
+
+Abre a janela do LocalChat: veja quem esta na rede na lista da esquerda, clique no
+par, digite a mensagem e pressione Enter. "Enviar arquivo" abre o seletor de
+arquivos do Windows. Tudo que chega aparece na conversa.
+
+### Linha de comando
+
 ```bash
 # 1) na primeira vez, cria a identidade (uma vez por maquina)
 localchat init --name notebook-raul
