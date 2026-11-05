@@ -19,8 +19,21 @@ sem servidor, sem nuvem, tudo criptografado de ponta a ponta.
 
 ```bash
 cargo build --release
-# binario em target/release/localchat.exe
+# binario em target/x86_64-pc-windows-gnu/release/localchat.exe
 ```
+
+## Instalador (para as maquinas de casa)
+
+```bash
+cargo build --release
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" setup.iss
+# gera dist\LocalChat-Setup-0.1.0.exe
+```
+
+Rode o exe gerado nas maquinas: instala em `C:\Program Files\LocalChat`, cria atalho
+no menu iniciar (e opcionalmente na area de trabalho), libera o firewall e oferece
+iniciar com o Windows. Desinstalar pelo Painel de Controle remove tudo (inclusive a
+regra do firewall).
 
 ## Uso
 
