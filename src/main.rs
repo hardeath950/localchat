@@ -8,7 +8,7 @@ mod session;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use discovery::PeerTable;
-use identity::{fingerprint, load_or_init};
+use identity::{fingerprint, load_or_init, pairing_code};
 use session::Ctx;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -120,6 +120,8 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Peers { timeout } => {
+            let (_id, _priv, pubk) = load_or_init(None)?;
+            let fp = fingerprint(&pubk);
             let found = discovery::scan(timeout).await?;
             if found.is_empty() {
                 println!("Nenhum par encontrado em {timeout}s.");
@@ -127,11 +129,11 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
             }
             for p in found {
                 println!(
-                    "{:20} {}:{}  fp {}",
+                    "{:20} {}:{}  codigo {}",
                     p.name,
                     p.ip,
                     p.port,
-                    &p.fp[..8.min(p.fp.len())]
+                    pairing_code(&fp, &p.fp)
                 );
             }
             Ok(())
@@ -262,7 +264,7 @@ async fn run_serve(
         let cmd = parts.next().unwrap_or("");
         match cmd {
             "/help" => print_help(),
-            "/peers" => print_peers(&table),
+            "/peers" => print_peers(&table, &fp),
             "/quit" => std::process::exit(0),
             "/msg" => {
                 let (alvo, texto) = match (parts.next(), parts.next()) {
@@ -314,7 +316,7 @@ fn print_help() {
     println!("  /quit                           sai");
 }
 
-fn print_peers(table: &PeerTable) {
+fn print_peers(table: &PeerTable, fp: &str) {
     let t = table.lock().unwrap();
     if t.is_empty() {
         println!("Nenhum par descoberto ainda (aguarde ums ou confira o firewall).");
@@ -324,11 +326,11 @@ fn print_peers(table: &PeerTable) {
     v.sort_by(|a, b| a.name.cmp(&b.name));
     for p in v {
         println!(
-            "{:20} {}:{}  fp {}",
+            "{:20} {}:{}  codigo {}",
             p.name,
             p.ip,
             p.port,
-            &p.fp[..8.min(p.fp.len())]
+            pairing_code(fp, &p.fp)
         );
     }
 }

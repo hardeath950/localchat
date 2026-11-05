@@ -58,7 +58,15 @@ pub async fn connect(addr: &str, ctx: &Ctx) -> Result<(SecureChannel<TcpStream>,
     if remote_fp != chan.remote_fingerprint() {
         bail!("seguranca: o par declarou fingerprint diferente do handshake");
     }
-    trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    if is_new {
+        let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
+        let msg = format!(
+            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com o outro aparelho)"
+        );
+        println!("{msg}");
+        ctx.emit(Event::Notice { text: msg });
+    }
     Ok((chan, remote_name))
 }
 
@@ -79,7 +87,15 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
     if remote_fp != chan.remote_fingerprint() {
         bail!("seguranca: o par declarou fingerprint diferente do handshake");
     }
-    trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    if is_new {
+        let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
+        let msg = format!(
+            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com a tela do outro aparelho)"
+        );
+        println!("{msg}");
+        ctx.emit(Event::Notice { text: msg });
+    }
 
     loop {
         let msg = match chan.recv_opt().await? {

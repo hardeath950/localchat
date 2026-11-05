@@ -38,6 +38,20 @@ pub fn fingerprint(public: &[u8]) -> String {
     hex::encode(Sha256::digest(public))
 }
 
+/// Codigo de pareamento de 6 digitos, derivado dos DOIS fingerprints.
+/// Como e simetrico, os dois lados mostram o mesmo numero — se um invasor
+/// estiver no meio, os fingerprints nao batem e o codigo aparece diferente.
+pub fn pairing_code(fp_a: &str, fp_b: &str) -> String {
+    let (lo, hi) = if fp_a <= fp_b { (fp_a, fp_b) } else { (fp_b, fp_a) };
+    let mut h = Sha256::new();
+    h.update(b"localchat-pair");
+    h.update(lo.as_bytes());
+    h.update(hi.as_bytes());
+    let d = h.finalize();
+    let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % 1_000_000;
+    format!("{n:06}")
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,7 +109,8 @@ pub fn save_trust(store: &TrustStore) -> Result<()> {
 
 /// TOFU: aceita a chave do par na primeira vez que aparece.
 /// Recusa se o nome ja existia gravado com outra chave (possivel sequestro de nome).
-pub fn trust_check(fp: &str, name: &str) -> std::result::Result<(), String> {
+/// Ok(true) = primeiro contato com esta chave.
+pub fn trust_check(fp: &str, name: &str) -> std::result::Result<bool, String> {
     let mut store = load_trust();
     for (k, e) in store.peers.iter() {
         if e.name.eq_ignore_ascii_case(name) && k != fp {
@@ -105,6 +120,7 @@ pub fn trust_check(fp: &str, name: &str) -> std::result::Result<(), String> {
             ));
         }
     }
+    let is_new = !store.peers.contains_key(fp);
     store.peers.insert(
         fp.to_string(),
         TrustEntry {
@@ -113,7 +129,7 @@ pub fn trust_check(fp: &str, name: &str) -> std::result::Result<(), String> {
         },
     );
     let _ = save_trust(&store);
-    Ok(())
+    Ok(is_new)
 }
 
 pub fn trust_forget(query: &str) -> usize {
