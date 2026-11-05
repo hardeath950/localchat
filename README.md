@@ -47,6 +47,10 @@ Abre a janela do LocalChat: veja quem esta na rede na lista da esquerda, clique 
 par, digite a mensagem e pressione Enter. "Enviar arquivo" abre o seletor de
 arquivos do Windows. Tudo que chega aparece na conversa.
 
+A janela tem icone na bandeja do Windows: fechar com o X esconde para a bandeja
+(o app continua rodando e recebendo); clique no icone para reabrir e o menu com
+botao direito tem "Abrir LocalChat" e "Sair".
+
 ### Linha de comando
 
 ```bash

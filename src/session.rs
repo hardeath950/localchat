@@ -15,6 +15,10 @@ pub enum Event {
     Chat { from: String, text: String },
     FileReceived { from: String, path: String, size: u64 },
     Notice { text: String },
+    /// Clique no icone da bandeja ou menu "Abrir".
+    GuiShow,
+    /// Menu "Sair" da bandeja.
+    GuiQuit,
 }
 
 pub struct Ctx {

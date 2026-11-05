@@ -99,6 +99,117 @@ struct GuiApp {
     me: String,
     fp: String,
     download_dir: PathBuf,
+    _tray: tray_icon::TrayIcon,
+    quit: bool,
+}
+
+/// Icone da bandeja: balao de chat azul com tres pontinhos.
+fn make_tray_icon() -> tray_icon::Icon {
+    const S: usize = 32;
+    let mut rgba = vec![0u8; S * S * 4];
+    for y in 0..S {
+        for x in 0..S {
+            let fx = x as f32;
+            let fy = y as f32;
+            // retangulo arredondado (balao)
+            let (x0, y0, x1, y1, r) = (2.0, 3.0, 29.0, 25.0, 7.0);
+            let in_bubble = {
+                if fx < x0 || fx > x1 || fy < y0 || fy > y1 {
+                    false
+                } else {
+                    let cx = fx.clamp(x0 + r, x1 - r);
+                    let cy = fy.clamp(y0 + r, y1 - r);
+                    (fx - cx).powi(2) + (fy - cy).powi(2) <= r * r
+                }
+            };
+            // rabicho
+            let in_tail = fy >= 24.0 && fy <= 29.0 && fx >= 10.0 && fx <= 16.0 && (fx - 10.0) <= (29.0 - fy);
+            // pontinhos brancos
+            let in_dot = (y == 13 || y == 14)
+                && ((10..13).contains(&x) || (15..18).contains(&x) || (20..23).contains(&x));
+            let i = (y * S + x) * 4;
+            if in_dot {
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            } else if in_bubble || in_tail {
+                rgba[i..i + 4].copy_from_slice(&[37, 99, 235, 255]);
+            }
+        }
+    }
+    tray_icon::Icon::from_rgba(rgba, S as u32, S as u32).expect("icone valido")
+}
+
+fn build_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray_icon::menu::MenuId)> {
+    use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let menu = Menu::new();
+    let mi_open = MenuItem::new("Abrir LocalChat", true, None);
+    let mi_quit = MenuItem::new("Sair", true, None);
+    menu.append(&mi_open)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&mi_quit)?;
+    let open_id = mi_open.id().clone();
+    let quit_id = mi_quit.id().clone();
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_tooltip("LocalChat — chat na rede local")
+        .with_icon(make_tray_icon())
+        .with_menu(Box::new(menu))
+        .build()
+        .map_err(|e| anyhow::anyhow!("bandeja: {e}"))?;
+    Ok((tray, open_id, quit_id))
+}
+
+/// Contexto egui compartilhado com os handlers da bandeja: fora da thread da
+/// UI eles podem (e devem) forcar um ciclo de logica com request_repaint.
+static EGUI_CTX: std::sync::OnceLock<std::sync::Mutex<Option<egui::Context>>> =
+    std::sync::OnceLock::new();
+
+fn egui_ctx_cell() -> &'static std::sync::Mutex<Option<egui::Context>> {
+    EGUI_CTX.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn wake_ui() {
+    if let Ok(g) = egui_ctx_cell().lock() {
+        if let Some(c) = g.as_ref() {
+            c.request_repaint();
+        }
+    }
+}
+
+/// Mostra a janela a partir de qualquer thread (handler da bandeja).
+fn show_from_anywhere() {
+    if let Ok(g) = egui_ctx_cell().lock() {
+        if let Some(c) = g.as_ref() {
+            c.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            c.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            c.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+}
+
+/// Integra os eventos da bandeja ao nosso canal de eventos.
+/// O canal proprio do tray-icon 0.26 nao entrega (receiver vazio mesmo com
+/// send disparando); o caminho documentado e `set_event_handler`.
+fn wire_tray_events(tx: tokio::sync::mpsc::UnboundedSender<Event>, open_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId) {
+    let menu_tx = tx.clone();
+    tray_icon::menu::MenuEvent::set_event_handler(Some(move |ev: tray_icon::menu::MenuEvent| {
+        if ev.id == quit_id {
+            let _ = menu_tx.send(Event::GuiQuit);
+        } else if ev.id == open_id {
+            let _ = menu_tx.send(Event::GuiShow);
+        }
+        wake_ui();
+    }));
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |ev: tray_icon::TrayIconEvent| {
+        if let tray_icon::TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } = ev
+        {
+            let _ = tx.send(Event::GuiShow);
+            show_from_anywhere();
+            wake_ui();
+        }
+    }));
 }
 
 /// Sobe o no completo (descoberta + servidor) e abre a janela.
@@ -167,6 +278,9 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         }
     });
 
+    let (tray, menu_open, menu_quit) = build_tray()?;
+    wire_tray_events(tx.clone(), menu_open, menu_quit);
+
     let app = GuiApp {
         rt,
         ctx,
@@ -186,6 +300,8 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
         me: id.name.clone(),
         fp,
         download_dir,
+        _tray: tray,
+        quit: false,
     };
 
     let options = eframe::NativeOptions {
@@ -200,6 +316,13 @@ pub fn run(listen: String, download_dir: Option<PathBuf>) -> Result<()> {
 }
 
 impl GuiApp {
+    fn show_window(&self, ctx: &egui::Context) {
+        // comandos de viewport so sao processados em um pass de pintura
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     fn log_line(&mut self, line: Line) {
         persist(&line);
         self.log.push(line);
@@ -291,7 +414,11 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Roda mesmo com a janela escondida: eventos da bandeja e do canal.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(mut g) = egui_ctx_cell().lock() {
+            *g = Some(ctx.clone());
+        }
         while let Ok(ev) = self.events.try_recv() {
             match ev {
                 Event::Chat { from, text } => self.log_line(Line::From(from, text)),
@@ -305,7 +432,30 @@ impl eframe::App for GuiApp {
                     self.status = text.clone();
                     self.log_line(Line::Notice(text));
                 }
+                Event::GuiShow => {
+                    self.show_window(ctx);
+                }
+                Event::GuiQuit => {
+                    self.quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
+        }
+        // mantem o loop de logica vivo mesmo com a janela escondida (senao
+        // os eventos da bandeja nunca sao lidos)
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // X na janela = esconder na bandeja (sair e pelo menu da bandeja)
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.quit {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
         }
 
         egui::Panel::left("pares")

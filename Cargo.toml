@@ -18,6 +18,12 @@ sha2 = "0.10"
 snow = "0.9"
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["full"] }
+tray-icon = "0.26.1"
 
 [profile.release]
 lto = "thin"
+
+# tray-icon 0.26.1 com patch local: Shell_NotifyIconGetRect falha em alguns
+# builds do Windows 11 e o crate descartava todos os eventos do tray.
+[patch.crates-io]
+tray-icon = { path = "vendor/tray-icon" }
