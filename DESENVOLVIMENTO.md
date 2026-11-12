@@ -17,8 +17,13 @@ e como publicar versões.
 - **Mensagens**: o destino confirma cada uma (`ChatAck`, protocolo 2); só então a GUI
   mostra "entregue". Versões de protocolo diferentes não conversam (a GUI avisa).
 - **Arquivos**: chunks de 32 KiB, SHA-256 do arquivo inteiro conferido no destino;
-  transferência interrompida é retomada do `.part`. O hash é calculado antes de conectar
-  (o servidor fecha conexão que não pede nada em 30 s).
+  transferência interrompida é retomada do `.part`. O hash é calculado durante o envio
+  (na retomada, os dois lados leem primeiro o trecho já transferido).
+- **Pasta compartilhada**: cada pasta vale para um fingerprint, até um prazo
+  (`~/.localchat/shares.json`). O par pede `ShareList { path }` (resposta `ShareListing`
+  + JSON em chunks) ou `ShareGet { path }` (resposta: `FileOffer` normal). Só depois da
+  confiança; o caminho é canonicalizado e precisa ficar dentro da pasta (`src/share.rs`),
+  e links não aparecem na listagem. Erros voltam como `Bye { reason }`.
 - **Perfil** (nome, recado, foto): o anúncio UDP leva `rev`, a versão do perfil. Quem vê
   um `rev` novo conecta e manda `ProfileRequest`; a resposta é `Profile { about, photo_len }`
   seguido de um `Chunk` com a foto (JPEG 128×128). É público: não grava confiança de
