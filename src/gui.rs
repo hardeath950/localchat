@@ -2397,7 +2397,9 @@ impl GuiApp {
                                 });
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Align::Min: centralizar ocuparia a altura que sobrou do quadro anterior
+                    // e a janela nunca encolheria ao abrir uma pasta com menos itens
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         if ui.button("Fechar").clicked() {
                             close = true;
                         }
