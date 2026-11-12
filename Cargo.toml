@@ -1,6 +1,6 @@
 [package]
 name = "localchat"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Chat e transferencia de arquivos na LAN, criptografado ponto a ponto"
 repository = "https://github.com/hardeath950/localchat"
