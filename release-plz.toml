@@ -4,6 +4,10 @@
 [workspace]
 # nao vai para o crates.io: so tag + GitHub Release (os binarios vem do release.yml)
 publish = false
+# versao publicada = ultima tag git (sem isto o release-plz consulta o crates.io e
+# diz "nothing to release")
+git_only = true
+git_tag_name = "v{{ version }}"
 git_release_enable = true
 git_tag_enable = true
 changelog_update = true
