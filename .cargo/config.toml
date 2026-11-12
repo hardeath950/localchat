@@ -1,4 +1,5 @@
-# Build com o toolchain GNU do MSYS2 (nao depende da MSVC).
+# Build com o toolchain GNU do MSYS2 (nao depende da MSVC). Use
+# scripts\build-windows.ps1 (ele escolhe o toolchain stable-x86_64-pc-windows-gnu).
 # CRT estatico => binario avulso, sem DLLs do mingw na maquina de destino.
 [build]
 target = "x86_64-pc-windows-gnu"

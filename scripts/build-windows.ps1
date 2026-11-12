@@ -7,6 +7,11 @@ Set-Location (Split-Path $PSScriptRoot -Parent)
 # o gcc do MSYS2 (linker e compilador do `ring`, usado no TLS do update) so acha
 # as proprias DLLs com a pasta dele no PATH
 $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+# toolchain GNU (sem Visual Studio). Vai por variavel porque o rustup novo recusa
+# "stable-x86_64-pc-windows-gnu" dentro do rust-toolchain.toml
+$env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+if ($LASTEXITCODE) { throw "rustup falhou" }
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
 Write-Host "==> LocalChat $version"

@@ -21,8 +21,7 @@ fi
 
 echo "==> 3/3 compilando (primeira vez leva uns minutos)"
 cd "$(dirname "$0")/.."
-# o repo fixa toolchain e target do Windows (rust-toolchain.toml e
-# .cargo/config.toml); aqui valem o toolchain e o target desta maquina
+# o .cargo/config.toml fixa o target do Windows; aqui vale o desta maquina
 export RUSTUP_TOOLCHAIN=stable
 host="$(rustc -vV | sed -n 's/^host: //p')"
 cargo build --release --target "$host"
