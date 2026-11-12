@@ -287,6 +287,13 @@ fn paint_lock(pa: &egui::Painter, r: Rect, c: Color32) {
     pa.add(egui::Shape::line(arc, Stroke::new(1.8, c)));
 }
 
+fn paint_folder(pa: &egui::Painter, r: Rect, c: Color32) {
+    let m = r.center();
+    // aba + corpo
+    pa.rect_filled(Rect::from_min_size(m + vec2(-8.0, -7.0), vec2(8.0, 5.0)), 1.5, c);
+    pa.rect_filled(Rect::from_center_size(m + vec2(0.0, 1.0), vec2(16.0, 11.0)), 2.0, c);
+}
+
 /// Aviao de papel (enviar), branco sobre o circulo de destaque.
 fn paint_send(pa: &egui::Painter, r: Rect, c: Color32) {
     let m = r.center();
@@ -634,7 +641,26 @@ enum Dialog {
     ConnectIp(String),
     /// Dados de outro computador (foto, recado, codigo de seguranca).
     Contact(String),
+    /// Pastas compartilhadas com um contato (a minha para ele e a dele para mim).
+    Share(ShareView),
     About,
+}
+
+struct ShareView {
+    fp: String,
+    /// Prazo escolhido para compartilhar, em horas.
+    hours: u64,
+    /// A pasta que eu compartilho com este contato (lida ao abrir e ao mudar).
+    mine: Option<crate::share::Share>,
+    /// Pasta do outro lado que esta na tela ("" = raiz).
+    path: String,
+    /// None = carregando.
+    listing: Option<Result<crate::session::Listing, String>>,
+}
+
+/// "13/11 às 14:02": ate quando um compartilhamento vale.
+fn until(t: u64) -> String {
+    local(t).map(|d| d.format("%d/%m às %H:%M").to_string()).unwrap_or_default()
 }
 
 /// Rascunho do "Meu perfil" (so vale ao clicar em Salvar).
@@ -1145,6 +1171,107 @@ impl GuiApp {
             for p in paths {
                 self.send_path(p);
             }
+        }
+    }
+
+    /// ip:porta do par, se estiver online numa versao compativel.
+    fn addr_of(&self, fp: &str) -> Option<String> {
+        self.online
+            .get(fp)
+            .filter(|p| p.v == crate::protocol::PROTO_VERSION)
+            .map(|p| format!("{}:{}", p.ip, p.port))
+    }
+
+    fn open_share(&mut self, fp: String) {
+        self.dialog = Dialog::Share(ShareView {
+            fp: fp.clone(),
+            hours: 24,
+            mine: crate::share::active(&fp),
+            path: String::new(),
+            listing: None,
+        });
+        self.share_browse(fp, String::new());
+    }
+
+    /// Pede a listagem de `path` na pasta que o par compartilhou (resposta: Event::ShareListed).
+    fn share_browse(&mut self, fp: String, path: String) {
+        let addr = self.addr_of(&fp);
+        let Dialog::Share(v) = &mut self.dialog else {
+            return;
+        };
+        v.path = path.clone();
+        v.listing = None;
+        let Some(addr) = addr else {
+            v.listing = Some(Err("O outro computador está offline ou usa outra versão do LocalChat.".into()));
+            return;
+        };
+        let (ctx, tx) = (self.ctx.clone(), self.tx.clone());
+        self.rt.spawn(async move {
+            let res = crate::session::share_list(&addr, &ctx, &fp, &path)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Event::ShareListed { fp, path, res });
+            wake_ui();
+        });
+    }
+
+    /// Baixa um arquivo da pasta do par: chega como arquivo recebido na conversa.
+    fn share_download(&mut self, fp: &str, path: String) {
+        let Some(addr) = self.addr_of(fp) else {
+            self.toast("O outro computador está offline");
+            return;
+        };
+        let (ctx, tx, fp) = (self.ctx.clone(), self.tx.clone(), fp.to_string());
+        self.rt.spawn(async move {
+            if let Err(e) = crate::session::share_get(&addr, &ctx, &fp, &path).await {
+                let _ = tx.send(Event::ShareFailed(format!("{e:#}")));
+                wake_ui();
+            }
+        });
+        self.toast("Baixando: o arquivo aparece na conversa");
+    }
+
+    /// Compartilha `share` com o par (None = para de compartilhar) e atualiza a janela.
+    fn share_set(&mut self, fp: &str, share: Option<crate::share::Share>) -> bool {
+        if let Err(e) = crate::share::set(fp, share.clone()) {
+            self.toast(format!("Não deu para salvar o compartilhamento: {e:#}"));
+            return false;
+        }
+        if let Dialog::Share(v) = &mut self.dialog {
+            v.mine = share;
+        }
+        true
+    }
+
+    fn share_pick(&mut self, fp: &str) {
+        let Dialog::Share(v) = &self.dialog else {
+            return;
+        };
+        let hours = v.hours;
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Escolher a pasta para compartilhar")
+            .pick_folder()
+        else {
+            return;
+        };
+        let share = crate::share::Share {
+            path,
+            expires: now_secs() + hours * 3600,
+        };
+        let folder = share.name();
+        if !self.share_set(fp, Some(share)) {
+            return;
+        }
+        // o outro lado fica sabendo pela propria conversa (se estiver online)
+        if self.addr_of(fp).is_some() && self.selected.as_deref() == Some(fp) {
+            let prazo = match hours {
+                1 => "1 hora".to_string(),
+                168 => "7 dias".to_string(),
+                h => format!("{h} horas"),
+            };
+            self.send_text(format!(
+                "Compartilhei a pasta \"{folder}\" com você por {prazo}. Abra pelo botão de pasta no topo desta conversa."
+            ));
         }
     }
 
@@ -1695,10 +1822,13 @@ impl GuiApp {
                         if icon_button(ui, 40.0, "Dados do contato e código de segurança", true, paint_lock).clicked() {
                             self.dialog = Dialog::Contact(fp.clone());
                         }
+                        if icon_button(ui, 40.0, "Pastas compartilhadas", true, paint_folder).clicked() {
+                            self.open_share(fp.clone());
+                        }
                     });
                     // a faixa inteira (foto + nome) abre os dados do contato, como no WhatsApp
                     let whole = ui.min_rect();
-                    let info = Rect::from_min_max(whole.min, pos2(whole.max.x - 48.0, whole.max.y));
+                    let info = Rect::from_min_max(whole.min, pos2(whole.max.x - 96.0, whole.max.y));
                     if ui
                         .interact(info, ui.scope_id().with("dados-contato"), Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2169,6 +2299,125 @@ impl GuiApp {
                 });
                 close |= r.should_close();
             }
+            Dialog::Share(v) => {
+                enum Act {
+                    Stop,
+                    Pick,
+                    Browse(String),
+                    Get(String),
+                }
+                let fp = v.fp.clone();
+                let name = self.contacts.get(&fp).cloned().unwrap_or_default();
+                let mine = v.mine.clone().filter(|s| s.expires > now_secs());
+                let mut act = None;
+                let r = egui::Modal::new(egui::Id::unique("pastas")).show(ctx, |ui| {
+                    let p = pal(ui);
+                    ui.set_width(460.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let weak = |t: String| egui::RichText::new(t).font(font(13.0)).color(p.weak);
+                    ui.label(egui::RichText::new("Pastas compartilhadas").font(bold(18.0)).color(p.text));
+
+                    ui.label(egui::RichText::new(format!("Sua pasta para {name}")).font(font(12.5)).color(p.accent));
+                    match &mine {
+                        Some(s) => {
+                            ui.label(egui::RichText::new(s.path.display().to_string()).color(p.text));
+                            ui.label(weak(format!(
+                                "{name} pode ver e baixar os arquivos até {}.",
+                                until(s.expires)
+                            )));
+                            if ui.button("Parar de compartilhar").clicked() {
+                                act = Some(Act::Stop);
+                            }
+                        }
+                        None => {
+                            ui.label(weak(format!(
+                                "{name} poderá ver e baixar tudo o que estiver na pasta (sem alterar nada) até o prazo acabar."
+                            )));
+                            ui.horizontal(|ui| {
+                                for (h, label) in [(1, "1 hora"), (24, "24 horas"), (168, "7 dias")] {
+                                    ui.radio_value(&mut v.hours, h, label);
+                                }
+                            });
+                            if ui.button("Escolher pasta…").clicked() {
+                                act = Some(Act::Pick);
+                            }
+                        }
+                    }
+                    ui.separator();
+
+                    ui.label(egui::RichText::new(format!("Pasta de {name}")).font(font(12.5)).color(p.accent));
+                    match &v.listing {
+                        None => {
+                            ui.label(weak("Carregando…".into()));
+                        }
+                        Some(Err(e)) => {
+                            ui.label(weak(e.clone()));
+                            if ui.button("Tentar de novo").clicked() {
+                                act = Some(Act::Browse(v.path.clone()));
+                            }
+                        }
+                        Some(Ok((root, expires, items))) => {
+                            ui.horizontal(|ui| {
+                                if !v.path.is_empty() && ui.button("Voltar").clicked() {
+                                    let up = v.path.rsplit_once('/').map_or("", |(a, _)| a);
+                                    act = Some(Act::Browse(up.to_string()));
+                                }
+                                let here = if v.path.is_empty() {
+                                    root.clone()
+                                } else {
+                                    format!("{root}/{}", v.path)
+                                };
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(here).font(bold(14.0)).color(p.text))
+                                        .truncate(),
+                                );
+                            });
+                            ui.label(weak(format!(
+                                "Disponível até {}. Clique num arquivo para baixar.",
+                                until(*expires)
+                            )));
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    if items.is_empty() {
+                                        ui.label(weak("Pasta vazia".into()));
+                                    }
+                                    for it in items {
+                                        if share_row(ui, p, it) {
+                                            let full = if v.path.is_empty() {
+                                                it.name.clone()
+                                            } else {
+                                                format!("{}/{}", v.path, it.name)
+                                            };
+                                            act = Some(if it.dir { Act::Browse(full) } else { Act::Get(full) });
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Fechar").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if let Some(a) = act {
+                    action = Some(Box::new(move |app: &mut GuiApp| {
+                        match a {
+                            Act::Stop => {
+                                app.share_set(&fp, None);
+                            }
+                            Act::Pick => app.share_pick(&fp),
+                            Act::Browse(path) => app.share_browse(fp, path),
+                            Act::Get(path) => app.share_download(&fp, path),
+                        }
+                        false
+                    }));
+                }
+                close |= r.should_close();
+            }
             Dialog::About => {
                 let (fp, dir) = (self.fp.clone(), self.download_dir.display().to_string());
                 let r = egui::Modal::new(egui::Id::unique("sobre")).show(ctx, |ui| {
@@ -2237,6 +2486,33 @@ fn fixed_row<R>(ui: &mut egui::Ui, h: f32, add: impl FnOnce(&mut egui::Ui) -> R)
     let size = vec2(ui.available_width(), h);
     ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), add)
         .inner
+}
+
+/// Linha da listagem de uma pasta compartilhada; true = clicada.
+fn share_row(ui: &mut egui::Ui, p: Pal, it: &crate::protocol::ShareEntry) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+    let pa = ui.painter();
+    if resp.hovered() {
+        pa.rect_filled(rect, 6.0, p.hover);
+    }
+    let (x0, x1, y) = (rect.left() + 8.0, rect.right() - 8.0, rect.center().y);
+    let mut right_w = 0.0;
+    if it.dir {
+        paint_folder(pa, Rect::from_center_size(pos2(x0 + 9.0, y), Vec2::splat(18.0)), p.weak);
+    } else {
+        let g = pa.layout_no_wrap(fmt_size(it.size), font(12.0), p.weak);
+        right_w = g.size().x + 12.0;
+        pa.galley(pos2(x1 - g.size().x, y - g.size().y / 2.0), g, p.weak);
+    }
+    let g = elided(pa, &it.name, font(14.0), p.text, x1 - x0 - 28.0 - right_w);
+    pa.galley(pos2(x0 + 28.0, y - g.size().y / 2.0), g, p.text);
+    let hint = if it.dir {
+        format!("Abrir a pasta {}", it.name)
+    } else {
+        format!("Baixar {} ({})", it.name, fmt_size(it.size))
+    };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &hint));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// Faixa centralizada (aviso de criptografia), com cadeado desenhado.
@@ -2557,6 +2833,15 @@ impl eframe::App for GuiApp {
                         e.photo = photo;
                     }
                 }
+                Event::ShareListed { fp, path, res } => {
+                    // resposta de uma pasta que nao esta mais na tela e descartada
+                    if let Dialog::Share(v) = &mut self.dialog {
+                        if v.fp == fp && v.path == path {
+                            v.listing = Some(res);
+                        }
+                    }
+                }
+                Event::ShareFailed(e) => self.toast(format!("Não deu para baixar: {e}")),
                 Event::GuiShow => show_window(ctx),
                 Event::UpdateAvailable(m) => self.update = Some(m),
                 Event::UpdateFailed(e) => {
