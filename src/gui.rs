@@ -565,7 +565,7 @@ impl Xfer {
     /// "45% · 230 MB de 1.2 GB · faltam 12 s"
     fn line(&self) -> String {
         if self.done == 0 {
-            // ainda calculando o SHA-256 do arquivo (segundos em arquivo grande)
+            // conectando, esperando o destino aprovar ou relendo o trecho de uma retomada
             return format!("preparando… · {}", fmt_size(self.total));
         }
         let mut s = format!("{}% · {} de {}", self.pct(), fmt_size(self.done), fmt_size(self.total));
@@ -2808,7 +2808,7 @@ impl eframe::App for GuiApp {
                             started: now,
                             start_done: done,
                         });
-                        // o relogio da velocidade comeca quando os bytes andam (o hash vem antes)
+                        // o relogio da velocidade comeca quando os bytes andam (a conexao vem antes)
                         if x.done == 0 && done > 0 {
                             x.started = now;
                             x.start_done = done;
@@ -2855,7 +2855,7 @@ impl eframe::App for GuiApp {
             }
         }
         // recebimento que caiu no meio nao avisa: a barra some sozinha. Os meus
-        // envios ficam (o hash de arquivo grande passa de 10 s sem progresso)
+        // envios ficam (a retomada de arquivo grande passa de 10 s sem progresso)
         let mine: Vec<String> = self.sending.values().map(|(n, _)| n.clone()).collect();
         self.transfers
             .retain(|(_, n), t| mine.contains(n) || t.updated.elapsed() < Duration::from_secs(10));

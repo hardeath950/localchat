@@ -8,8 +8,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Resul
     if data.len() > MAX_CIPHER {
         bail!("frame grande demais: {}", data.len());
     }
-    w.write_all(&(data.len() as u32).to_be_bytes()).await?;
-    w.write_all(data).await?;
+    // tamanho + dados numa escrita so: com TCP_NODELAY, duas escritas viram
+    // duas chamadas ao sistema e dois pacotes por frame
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    w.write_all(&frame).await?;
     w.flush().await?;
     Ok(())
 }
