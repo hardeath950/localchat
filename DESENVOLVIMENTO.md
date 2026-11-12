@@ -61,9 +61,53 @@ localchat msg 192.168.0.10 "cheguei"
 localchat send 192.168.0.10 ./fotos.zip
 localchat trust --list                 # pares confiados
 localchat trust --forget <fingerprint> # esquecer (ex.: reinstalou o outro PC)
+localchat mcp                          # servidor MCP para agentes de IA (abaixo)
 ```
 
 `LOCALCHAT_HOME` troca a pasta de estado (útil para testar várias identidades numa máquina).
+
+## Agentes de IA (MCP)
+
+`localchat mcp` roda um nó do chat como servidor [MCP](https://modelcontextprotocol.io)
+no stdin/stdout (JSON-RPC, uma linha por mensagem). O agente vira **um contato a mais na
+rede**, com chave própria em `~/.localchat-agente` (ou `LOCALCHAT_HOME`), na porta 47822.
+Assim ele nunca usa a sua chave, e a sua janela continua aberta ao mesmo tempo.
+
+Ferramentas:
+
+| ferramenta | o que faz |
+|---|---|
+| `peers` | quem está na rede: nome, `ip:porta`, fingerprint, código de pareamento |
+| `send_message {to, text}` | envia e espera a confirmação de entrega |
+| `send_file {to, path}` | envia um arquivo (caminho absoluto) |
+| `read_messages {after?}` | mensagens, arquivos e pedidos de contato recebidos desde que o servidor iniciou (últimos 1000, cada um com `id`); `after` traz só os novos |
+
+Claude Code (o nome do agente na rede só vale na primeira vez, quando a identidade é criada):
+
+```bash
+claude mcp add localchat -- localchat mcp --name assistente
+```
+
+O instalador do Windows não põe o `localchat` no PATH: use o caminho completo
+(`"C:\Program Files\LocalChat\localchat.exe"`).
+
+Outros clientes (`.mcp.json` e similares):
+
+```json
+{ "mcpServers": { "localchat": { "command": "localchat", "args": ["mcp", "--name", "assistente"] } } }
+```
+
+- **Contato novo**: por padrão o agente **recusa** quem o procura pela primeira vez (fica
+  registrado em `read_messages` como `contact_request`). Ele conversa com quem ele
+  contatar primeiro; o outro lado aceita na janela, como sempre. `--accept-new` aceita
+  qualquer um. Quem decide é o dono do agente, nunca o agente.
+- **Vários agentes na mesma máquina**: cada um com sua pasta e porta, por exemplo
+  `LOCALCHAT_HOME=~/.localchat-revisor localchat mcp --name revisor --listen 0.0.0.0:47823`.
+- Arquivos recebidos vão para `<pasta do agente>/recebidos` (`--download-dir` troca).
+- O que chega é escrito por outras pessoas: para o agente, é dado e não instrução
+  (risco de prompt injection).
+- No modo MCP nada mais escreve no stdout: os avisos do nó vão para o stderr, e as
+  mensagens do `session.rs` passam por `Ctx::say`, que só imprime na CLI.
 
 ## Publicar uma versão
 

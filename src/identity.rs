@@ -85,12 +85,13 @@ pub fn load_or_init(name: Option<String>) -> Result<(Identity, Vec<u8>, Vec<u8>)
         public_hex: hex::encode(&kp.public),
     };
     std::fs::write(&path, serde_json::to_string_pretty(&id)?)?;
-    println!("Identidade '{name}' criada em {}", path.display());
+    // stderr: no `localchat mcp` o stdout e o canal JSON-RPC
+    eprintln!("Identidade '{name}' criada em {}", path.display());
     Ok((id, kp.private, kp.public))
 }
 
 /// Nome da maquina, nao do usuario: o mesmo usuario em dois PCs daria nomes iguais.
-fn default_name() -> String {
+pub fn default_name() -> String {
     std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
