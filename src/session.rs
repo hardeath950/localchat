@@ -91,6 +91,14 @@ impl Ctx {
         crate::profile::rev(&self.name(), &self.profile.read().unwrap())
     }
 
+    /// Texto para o terminal: so na CLI (sem UI). Com UI ou MCP o stdout nao e do usuario
+    /// (no MCP ele e o canal JSON-RPC: qualquer linha solta quebra o cliente).
+    pub fn say(&self, msg: &str) {
+        if self.notify.is_none() {
+            println!("{msg}");
+        }
+    }
+
     pub fn emit(&self, ev: Event) {
         if let Some(tx) = &self.notify {
             let _ = tx.send(ev);
@@ -142,7 +150,7 @@ pub async fn connect(
         let msg = format!(
             "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
         );
-        println!("{msg}");
+        ctx.say(&msg);
         ctx.emit(Event::Notice { text: msg });
     }
     Ok((chan, remote_name))
@@ -284,7 +292,7 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
         let msg = format!(
             "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
         );
-        println!("{msg}");
+        ctx.say(&msg);
         ctx.emit(Event::Notice { text: msg });
         // aprovacao explicita: a UI (ou o timeout) decide
         if !ctx.request_approval(&remote_name, &code).await {
@@ -300,7 +308,7 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
                 while let Ok(Some(_)) = chan.recv_opt().await {}
             })
             .await;
-            println!("conexao com '{remote_name}' recusada");
+            ctx.say(&format!("conexao com '{remote_name}' recusada"));
             ctx.emit(Event::Notice {
                 text: format!("você recusou '{remote_name}'"),
             });
@@ -320,7 +328,7 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
         };
         match msg {
             Msg::Control(Control::Chat { text }) => {
-                println!("[{}] {}", remote_name, text);
+                ctx.say(&format!("[{remote_name}] {text}"));
                 ctx.emit(Event::Chat {
                     from: remote_name.clone(),
                     fp: remote_fp.clone(),
@@ -562,7 +570,7 @@ async fn send_file_over_channel(
     if offset > 0 {
         let pct = offset * 100 / size.max(1);
         let msg = format!("retomando envio de '{name}' a partir de {pct}%");
-        println!("{msg}");
+        ctx.say(&msg);
         emit(Event::Notice { text: msg });
     }
 
@@ -603,7 +611,7 @@ async fn send_file_over_channel(
     .await?;
     match chan.recv().await? {
         Msg::Control(Control::FileAck { ok: true, note, .. }) => {
-            println!("enviado com sucesso ({note})");
+            ctx.say(&format!("enviado com sucesso ({note})"));
             Ok(())
         }
         Msg::Control(Control::FileAck { ok: false, note, .. }) => bail!("par recusou: {note}"),
@@ -640,7 +648,7 @@ async fn receive_file(
             offset = s - (s % CHUNK_SIZE as u64);
             let pct = offset * 100 / size.max(1);
             let msg = format!("retomando recebimento de '{name}' a partir de {pct}%");
-            println!("[{remote}] {msg}");
+            ctx.say(&format!("[{remote}] {msg}"));
             ctx.emit(Event::Notice { text: msg });
         }
     }
@@ -734,12 +742,7 @@ async fn receive_file(
                     note: "ok".into(),
                 })
                 .await?;
-                println!(
-                    "[{}] arquivo recebido: {} ({} bytes)",
-                    remote,
-                    path.display(),
-                    size
-                );
+                ctx.say(&format!("[{remote}] arquivo recebido: {} ({size} bytes)", path.display()));
                 ctx.emit(Event::Progress {
                     name: name.to_string(),
                     fp: remote_fp.to_string(),

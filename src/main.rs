@@ -2,6 +2,7 @@ mod channel;
 mod discovery;
 mod gui;
 mod identity;
+mod mcp;
 mod profile;
 mod protocol;
 mod session;
@@ -73,6 +74,21 @@ enum Cmd {
         #[arg(long)]
         download_dir: Option<PathBuf>,
     },
+    /// Servidor MCP (stdin/stdout) para agentes de IA: o agente vira um contato na rede.
+    /// Identidade propria em ~/.localchat-agente (ou LOCALCHAT_HOME); um agente por pasta e porta.
+    Mcp {
+        #[arg(long, default_value = "0.0.0.0:47822")]
+        listen: String,
+        #[arg(long)]
+        download_dir: Option<PathBuf>,
+        /// Nome do agente na rede (so vale ao criar a identidade). Padrao: <maquina>-agente
+        #[arg(long)]
+        name: Option<String>,
+        /// Aceita conexao de contato novo sem perguntar (padrao: recusa; o agente
+        /// ainda conversa com quem ele contatar primeiro)
+        #[arg(long)]
+        accept_new: bool,
+    },
     /// Lista ou esquece chaves confiadas (TOFU)
     Trust {
         #[arg(long)]
@@ -84,6 +100,11 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.cmd, Cmd::Mcp { .. }) && std::env::var_os("LOCALCHAT_HOME").is_none() {
+        // o agente nunca usa a chave do usuario: mesma chave em dois nos some da lista
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        std::env::set_var("LOCALCHAT_HOME", home.join(".localchat-agente"));
+    }
     match cli.cmd {
         Cmd::Gui {
             listen,
@@ -166,6 +187,15 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
             no_auto_accept,
             no_discovery,
         } => run_serve(listen, download_dir, no_auto_accept, no_discovery).await,
+        Cmd::Mcp {
+            listen,
+            download_dir,
+            name,
+            accept_new,
+        } => {
+            let name = name.unwrap_or_else(|| format!("{}-agente", identity::default_name()));
+            mcp::run(listen, download_dir, name, accept_new).await
+        }
         Cmd::Gui { .. } => unreachable!(),
     }
 }
@@ -222,25 +252,7 @@ async fn run_serve(
     println!("Arquivos recebidos em: {}", download_dir.display());
     println!("Comandos: /help");
 
-    let accept_ctx = ctx.clone();
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    let c = accept_ctx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = session::handle_conn(stream, c).await {
-                            eprintln!("[{peer}] conexao encerrada: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("accept: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-            }
-        }
-    });
+    spawn_accept(listener, ctx.clone());
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
@@ -302,6 +314,28 @@ async fn run_serve(
     std::future::pending::<()>().await;
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Atende cada conexao entrante numa task propria.
+fn spawn_accept(listener: TcpListener, ctx: Arc<Ctx>) {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    let c = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = session::handle_conn(stream, c).await {
+                            eprintln!("[{peer}] conexao encerrada: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
 }
 
 fn print_help() {
