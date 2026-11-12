@@ -2,6 +2,16 @@
 
 As versões novas são escritas pelo release-plz a partir dos commits (`feat:`, `fix:`...).
 
+## [0.2.4](https://github.com/hardeath950/localchat/compare/v0.2.3...v0.2.4) - 2026-11-12
+
+### Added
+
+- servidor MCP para agentes de IA (localchat mcp)
+
+### Other
+
+- como conectar agentes de IA via MCP no README
+
 ## [0.2.3](https://github.com/hardeath950/localchat/compare/v0.2.2...v0.2.3) - 2026-11-12
 
 ### Added
