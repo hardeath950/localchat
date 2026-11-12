@@ -52,7 +52,7 @@ pub fn pairing_code(fp_a: &str, fp_b: &str) -> String {
     format!("{n:06}")
 }
 
-fn now() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

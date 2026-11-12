@@ -1,6 +1,6 @@
 use crate::channel::{Msg, SecureChannel};
 use crate::identity::{fingerprint, trust_check};
-use crate::protocol::{Control, CHUNK_SIZE};
+use crate::protocol::{Control, ShareEntry, CHUNK_SIZE};
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -34,7 +34,14 @@ pub enum Event {
     UpdateFailed(String),
     /// Perfil de outro computador buscado (foto ja normalizada; vazia = sem foto).
     ProfileFetched { fp: String, rev: String, about: String, photo: Vec<u8> },
+    /// Resposta ao pedido de listagem da pasta que o par `fp` compartilhou.
+    ShareListed { fp: String, path: String, res: Result<Listing, String> },
+    /// O download de um arquivo de pasta compartilhada falhou.
+    ShareFailed(String),
 }
+
+/// Uma pasta compartilhada pelo par: (nome da pasta raiz, expira em, itens).
+pub type Listing = (String, u64, Vec<ShareEntry>);
 
 /// Fila de aprovacoes pendentes: a UI decide "Confiar / Recusar" cada par novo.
 #[derive(Default)]
@@ -326,11 +333,108 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
                 receive_file(&mut chan, &file_id, &name, size, &ctx, &remote_name, &remote_fp)
                     .await?;
             }
+            Msg::Control(Control::ShareList { path }) => {
+                serve_share(&mut chan, &ctx, &remote_fp, &path, false).await?;
+            }
+            Msg::Control(Control::ShareGet { path }) => {
+                serve_share(&mut chan, &ctx, &remote_fp, &path, true).await?;
+            }
             Msg::Control(Control::Bye { .. }) => break,
             Msg::Control(_) => {}
             Msg::Chunk { .. } => bail!("chunk fora de contexto"),
         }
     }
+    Ok(())
+}
+
+/// Listagem maior que isto nao e montada nem aceita.
+// shortcut: pasta com dezenas de milhares de itens nao lista; paginar se alguem precisar
+const MAX_LISTING: usize = 8 << 20;
+
+/// Atende `ShareList` (`get` = false) e `ShareGet`: so para quem tem um
+/// compartilhamento valido (a chave e a do handshake) e so dentro da pasta.
+/// Recusa = `Bye` com o motivo, sem caminhos deste computador.
+async fn serve_share(
+    chan: &mut SecureChannel<TcpStream>,
+    ctx: &Ctx,
+    fp: &str,
+    rel: &str,
+    get: bool,
+) -> Result<()> {
+    let found = crate::share::active(fp)
+        .context("nenhuma pasta compartilhada com você (ou o prazo acabou)")
+        .and_then(|share| {
+            let real = crate::share::resolve(&share.path, rel)?;
+            if get {
+                if !real.is_file() {
+                    bail!("não é um arquivo");
+                }
+                return Ok((share, real, Vec::new()));
+            }
+            let json = serde_json::to_vec(&crate::share::list(&real)?)?;
+            if json.len() > MAX_LISTING {
+                bail!("pasta grande demais para listar");
+            }
+            Ok((share, real, json))
+        });
+    let (share, real, json) = match found {
+        Ok(v) => v,
+        Err(e) => return chan.send_control(&Control::Bye { reason: e.to_string() }).await,
+    };
+    if get {
+        let sha256 = hash_file(&real).await?;
+        return send_file_over_channel(chan, &real, ctx, sha256, false).await;
+    }
+    chan.send_control(&Control::ShareListing {
+        name: share.name(),
+        expires: share.expires,
+        len: json.len() as u32,
+    })
+    .await?;
+    for (i, part) in json.chunks(CHUNK_SIZE).enumerate() {
+        chan.send_chunk(&[0u8; 16], i as u32, part).await?;
+    }
+    Ok(())
+}
+
+/// Lista `path` ("" = raiz) na pasta que o par compartilhou conosco.
+pub async fn share_list(addr: &str, ctx: &Ctx, fp: &str, path: &str) -> Result<Listing> {
+    let (mut chan, _) = connect(addr, ctx, Some(fp)).await?;
+    chan.send_control(&Control::ShareList { path: path.to_string() })
+        .await?;
+    let (name, expires, len) = match chan.recv().await? {
+        Msg::Control(Control::ShareListing { name, expires, len }) => (name, expires, len as usize),
+        Msg::Control(Control::Bye { reason }) => bail!("{reason}"),
+        _ => bail!("resposta inesperada ao pedido de listagem"),
+    };
+    if len > MAX_LISTING {
+        bail!("pasta grande demais para listar");
+    }
+    let mut json = Vec::with_capacity(len);
+    while json.len() < len {
+        match chan.recv().await? {
+            Msg::Chunk { data, .. } if !data.is_empty() => json.extend_from_slice(&data),
+            _ => bail!("listagem interrompida"),
+        }
+    }
+    graceful_bye(&mut chan).await;
+    Ok((name, expires, serde_json::from_slice(&json).context("listagem inválida")?))
+}
+
+/// Baixa um arquivo da pasta que o par compartilhou: ele responde com um envio
+/// normal, que cai na pasta de recebidos (com retomada, hash e progresso).
+pub async fn share_get(addr: &str, ctx: &Ctx, fp: &str, path: &str) -> Result<()> {
+    let (mut chan, remote) = connect(addr, ctx, Some(fp)).await?;
+    chan.send_control(&Control::ShareGet { path: path.to_string() })
+        .await?;
+    match chan.recv().await? {
+        Msg::Control(Control::FileOffer { file_id, name, size }) => {
+            receive_file(&mut chan, &file_id, &name, size, ctx, &remote, fp).await?;
+        }
+        Msg::Control(Control::Bye { reason }) => bail!("{reason}"),
+        _ => bail!("resposta inesperada ao pedido de arquivo"),
+    }
+    graceful_bye(&mut chan).await;
     Ok(())
 }
 
@@ -364,7 +468,7 @@ pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path, expect_fp: Option<&st
     }
     let sha256 = hash_file(path).await?;
     let (mut chan, remote) = connect(addr, ctx, expect_fp).await?;
-    send_file_over_channel(&mut chan, path, ctx, sha256).await?;
+    send_file_over_channel(&mut chan, path, ctx, sha256, true).await?;
     graceful_bye(&mut chan).await;
     Ok(remote)
 }
@@ -406,9 +510,16 @@ async fn send_file_over_channel(
     path: &Path,
     ctx: &Ctx,
     sha256: String,
+    // false = download de pasta compartilhada: quem serve nao ve barra nem aviso
+    show: bool,
 ) -> Result<()> {
     // a UI mostra o progresso dentro da conversa deste par
     let peer_fp = chan.remote_fingerprint();
+    let emit = |ev| {
+        if show {
+            ctx.emit(ev)
+        }
+    };
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
         bail!("nao e um arquivo: {}", path.display());
@@ -450,7 +561,7 @@ async fn send_file_over_channel(
         let pct = offset * 100 / size.max(1);
         let msg = format!("retomando envio de '{name}' a partir de {pct}%");
         println!("{msg}");
-        ctx.emit(Event::Notice { text: msg });
+        emit(Event::Notice { text: msg });
     }
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -468,7 +579,7 @@ async fn send_file_over_channel(
         since_progress += 1;
         if since_progress >= 16 {
             since_progress = 0;
-            ctx.emit(Event::Progress {
+            emit(Event::Progress {
                 name: name.clone(),
                 fp: peer_fp.clone(),
                 done: sent,
@@ -476,7 +587,7 @@ async fn send_file_over_channel(
             });
         }
     }
-    ctx.emit(Event::Progress {
+    emit(Event::Progress {
         name: name.clone(),
         fp: peer_fp.clone(),
         done: size,
@@ -772,6 +883,26 @@ mod tests {
         send_chat(&addr, &tx, "oi", None).await.unwrap();
         assert!(send_chat(&addr, &tx, "oi", Some("outra-chave")).await.is_err());
         assert_eq!(std::fs::read(dl.join("a.bin")).unwrap(), data);
+
+        // pasta compartilhada: so para quem ela foi aberta, so dentro dela, so no prazo
+        let shared = tmp.join("pasta");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::write(shared.join("sub/doc.bin"), &data).unwrap();
+        assert!(share_list(&addr, &tx, &rx_fp, "").await.is_err());
+        let now = crate::identity::now();
+        let share = |expires| Some(crate::share::Share { path: shared.clone(), expires });
+        crate::share::set(&tx.fp(), share(now + 60)).unwrap();
+        let (name, _, items) = share_list(&addr, &tx, &rx_fp, "").await.unwrap();
+        assert_eq!((name.as_str(), items.len(), items[0].dir), ("pasta", 1, true));
+        assert_eq!(share_list(&addr, &tx, &rx_fp, "sub").await.unwrap().2[0].size, data.len() as u64);
+        assert!(share_list(&addr, &tx, &rx_fp, "../dl").await.is_err());
+        assert!(share_get(&addr, &tx, &rx_fp, "../a.bin").await.is_err());
+        assert!(share_get(&addr, &tx, &rx_fp, "sub").await.is_err());
+        share_get(&addr, &tx, &rx_fp, "sub/doc.bin").await.unwrap();
+        assert_eq!(std::fs::read(tmp.join("doc.bin")).unwrap(), data);
+        crate::share::set(&tx.fp(), share(now - 1)).unwrap();
+        assert!(share_list(&addr, &tx, &rx_fp, "").await.is_err());
+        assert!(share_get(&addr, &tx, &rx_fp, "sub/doc.bin").await.is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

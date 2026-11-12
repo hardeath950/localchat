@@ -60,6 +60,33 @@ pub enum Control {
     Bye {
         reason: String,
     },
+    /// Lista uma pasta do compartilhamento que o outro lado abriu para nos
+    /// ("" = raiz, niveis separados por "/"). Resposta: `ShareListing` ou `Bye`.
+    /// Versoes antigas nao conhecem estas mensagens e derrubam a conexao.
+    ShareList {
+        path: String,
+    },
+    /// A listagem (JSON de `Vec<ShareEntry>`) vem logo depois em `Chunk`s
+    /// somando `len` bytes: uma pasta cheia nao cabe num frame so.
+    ShareListing {
+        /// Nome da pasta raiz, para mostrar na tela.
+        name: String,
+        /// Ate quando vale (segundos desde 1970).
+        expires: u64,
+        len: u32,
+    },
+    /// Pede um arquivo do compartilhamento: a resposta e um `FileOffer` normal (ou `Bye`).
+    ShareGet {
+        path: String,
+    },
+}
+
+/// Um item de uma pasta compartilhada.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ShareEntry {
+    pub name: String,
+    pub size: u64,
+    pub dir: bool,
 }
 
 /// Beacon UDP de descobertura na LAN.

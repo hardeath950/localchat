@@ -42,6 +42,11 @@ e pergunta se o LocalChat deve abrir junto com o computador.
 - **Arquivo:** botão **+** ou arraste para a janela (vários de uma vez). Arquivos grandes
   mostram a porcentagem e quanto tempo falta; o **✕** cancela. Os recebidos ficam na pasta
   **Downloads/LocalChat**: clique no arquivo para abrir (botão direito mostra na pasta).
+- **Compartilhar uma pasta por um tempo:** ícone de pasta no topo da conversa → escolha o
+  prazo (1 hora, 24 horas ou 7 dias) e a pasta. O contato abre o mesmo ícone no computador
+  dele, navega e baixa o que quiser, sem poder alterar nada. Vale só para esse contato,
+  uma pasta por contato, e só enquanto o seu LocalChat estiver aberto. Os dois precisam da
+  mesma versão do app.
 - **Seu perfil:** clique na sua foto, no topo à esquerda, para mudar nome, recado e foto.
   Todos os computadores da rede veem o seu perfil.
 - **Dados de um contato:** clique no nome dele no topo da conversa (foto, recado e código

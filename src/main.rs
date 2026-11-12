@@ -5,6 +5,7 @@ mod identity;
 mod profile;
 mod protocol;
 mod session;
+mod share;
 mod update;
 
 use anyhow::{bail, Context, Result};
