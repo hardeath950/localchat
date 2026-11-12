@@ -17,7 +17,14 @@ e como publicar versões.
 - **Mensagens**: o destino confirma cada uma (`ChatAck`, protocolo 2); só então a GUI
   mostra "entregue". Versões de protocolo diferentes não conversam (a GUI avisa).
 - **Arquivos**: chunks de 32 KiB, SHA-256 do arquivo inteiro conferido no destino;
-  transferência interrompida é retomada do `.part`.
+  transferência interrompida é retomada do `.part`. O hash é calculado antes de conectar
+  (o servidor fecha conexão que não pede nada em 30 s).
+- **Perfil** (nome, recado, foto): o anúncio UDP leva `rev`, a versão do perfil. Quem vê
+  um `rev` novo conecta e manda `ProfileRequest`; a resposta é `Profile { about, photo_len }`
+  seguido de um `Chunk` com a foto (JPEG 128×128). É público: não grava confiança de
+  nenhum lado nem pede aprovação. Versões sem `rev` (≤ 0.2.1) nunca recebem o pedido. A foto
+  recebida é decodificada com limites e re-codificada (`src/profile.rs`); cache em
+  `~/.localchat/contatos/`.
 - **Histórico** (GUI): `~/.localchat/history.jsonl`, últimas 1000 linhas.
 
 ## Compilar

@@ -17,6 +17,8 @@ pub struct PeerInfo {
     pub last_seen: Instant,
     /// Versao do protocolo que ele anuncia (diferente da nossa = nao conversam).
     pub v: u32,
+    /// Versao do perfil anunciada (vazia = versao antiga, sem perfil).
+    pub rev: String,
 }
 
 pub type PeerTable = Arc<Mutex<HashMap<String, PeerInfo>>>;
@@ -54,7 +56,7 @@ pub fn add_manual(ip: Ipv4Addr) {
 /// Pede para a instancia ja aberta nesta maquina mostrar a janela.
 pub fn show_running_instance() {
     if let Ok(s) = StdUdp::bind(("127.0.0.1", 0)) {
-        let _ = s.send_to(&beacon("show", "", 0, ""), ("127.0.0.1", DISCOVERY_PORT));
+        let _ = s.send_to(&beacon("show", "", 0, "", ""), ("127.0.0.1", DISCOVERY_PORT));
     }
 }
 
@@ -71,7 +73,7 @@ pub fn bind_udp(port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::from_std(make_socket(port)?)?)
 }
 
-fn beacon(kind: &str, name: &str, port: u16, fp: &str) -> Vec<u8> {
+fn beacon(kind: &str, name: &str, port: u16, fp: &str, rev: &str) -> Vec<u8> {
     serde_json::to_vec(&Beacon {
         app: "localchat".into(),
         v: PROTO_VERSION,
@@ -79,6 +81,7 @@ fn beacon(kind: &str, name: &str, port: u16, fp: &str) -> Vec<u8> {
         name: name.into(),
         port,
         fp: fp.into(),
+        rev: rev.into(),
     })
     .expect("beacon serializa")
 }
@@ -88,12 +91,13 @@ pub async fn announce_loop(sock: Arc<UdpSocket>, ctx: Arc<Ctx>, port: u16) {
     let fp = ctx.fp();
     loop {
         let name = ctx.name();
-        let msg = beacon("announce", &name, port, &fp);
+        let rev = ctx.profile_rev();
+        let msg = beacon("announce", &name, port, &fp, &rev);
         let _ = sock.send_to(&msg, ("255.255.255.255", DISCOVERY_PORT)).await;
         // IPs manuais: o anuncio faz eles nos verem, a consulta faz nos os vermos
         let manual = MANUAL.lock().unwrap().clone();
         if !manual.is_empty() {
-            let query = beacon("query", &name, port, &fp);
+            let query = beacon("query", &name, port, &fp, &rev);
             for ip in manual {
                 let _ = sock.send_to(&msg, (ip, DISCOVERY_PORT)).await;
                 let _ = sock.send_to(&query, (ip, DISCOVERY_PORT)).await;
@@ -132,7 +136,7 @@ pub async fn listen_loop(sock: Arc<UdpSocket>, table: PeerTable, ctx: Arc<Ctx>, 
             // a consulta do `localchat peers` vem sem fingerprint
             "query" => {
                 if b.fp != self_fp {
-                    let ans = beacon("answer", &ctx.name(), port, &self_fp);
+                    let ans = beacon("answer", &ctx.name(), port, &self_fp, &ctx.profile_rev());
                     let _ = sock.send_to(&ans, src).await;
                 }
                 continue;
@@ -158,6 +162,7 @@ pub async fn listen_loop(sock: Arc<UdpSocket>, table: PeerTable, ctx: Arc<Ctx>, 
                 fp: b.fp,
                 last_seen: Instant::now(),
                 v: b.v,
+                rev: b.rev,
             },
         );
     }
@@ -168,7 +173,7 @@ pub async fn listen_loop(sock: Arc<UdpSocket>, table: PeerTable, ctx: Arc<Ctx>, 
 /// soquete por porta, entao o scan precisa estar na 47820 para ouvir anuncios.
 pub async fn scan(secs: u64) -> Result<Vec<PeerInfo>> {
     let sock = Arc::new(UdpSocket::from_std(make_socket(DISCOVERY_PORT)?)?);
-    let q = beacon("query", "?", 0, "");
+    let q = beacon("query", "?", 0, "", "");
     let _ = sock.send_to(&q, ("255.255.255.255", DISCOVERY_PORT)).await;
     let mut found: HashMap<String, PeerInfo> = HashMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
@@ -195,6 +200,7 @@ pub async fn scan(secs: u64) -> Result<Vec<PeerInfo>> {
                     fp: b.fp,
                     last_seen: Instant::now(),
                     v: b.v,
+                    rev: b.rev,
                 },
             );
         }

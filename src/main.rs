@@ -2,6 +2,7 @@ mod channel;
 mod discovery;
 mod gui;
 mod identity;
+mod profile;
 mod protocol;
 mod session;
 mod update;
@@ -178,6 +179,7 @@ fn one_shot_ctx() -> Result<Ctx> {
         auto_accept: true,
         notify: None,
         approvals: Default::default(),
+        profile: Default::default(),
     })
 }
 
@@ -200,6 +202,7 @@ async fn run_serve(
         auto_accept: !no_auto_accept,
         notify: None,
         approvals: Default::default(),
+        profile: std::sync::RwLock::new(profile::load_own()),
     });
 
     let table: PeerTable = Arc::new(Mutex::new(HashMap::new()));

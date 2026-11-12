@@ -22,7 +22,8 @@ pub enum Event {
     /// Par novo pedindo conexao: a UI responde com Confiar/Recusar.
     ApprovalRequest { id: u64, name: String, code: String },
     /// Progresso de transferencia de arquivo.
-    Progress { name: String, done: u64, total: u64 },
+    /// `fp` = o outro lado (para mostrar dentro da conversa certa).
+    Progress { fp: String, name: String, done: u64, total: u64 },
     /// Clique no icone da bandeja ou menu "Abrir".
     GuiShow,
     /// Menu "Sair" da bandeja.
@@ -31,6 +32,8 @@ pub enum Event {
     UpdateAvailable(crate::update::Manifest),
     /// O download/instalacao do update falhou.
     UpdateFailed(String),
+    /// Perfil de outro computador buscado (foto ja normalizada; vazia = sem foto).
+    ProfileFetched { fp: String, rev: String, about: String, photo: Vec<u8> },
 }
 
 /// Fila de aprovacoes pendentes: a UI decide "Confiar / Recusar" cada par novo.
@@ -63,6 +66,8 @@ pub struct Ctx {
     pub auto_accept: bool,
     pub notify: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
     pub approvals: Arc<ApprovalGate>,
+    /// Recado e foto deste computador (publicos na rede).
+    pub profile: std::sync::RwLock<crate::profile::Profile>,
 }
 
 impl Ctx {
@@ -72,6 +77,11 @@ impl Ctx {
 
     pub fn name(&self) -> String {
         self.name.read().unwrap().clone()
+    }
+
+    /// Versao do perfil para o anuncio na rede.
+    pub fn profile_rev(&self) -> String {
+        crate::profile::rev(&self.name(), &self.profile.read().unwrap())
     }
 
     pub fn emit(&self, ev: Event) {
@@ -118,6 +128,59 @@ pub async fn connect(
     ctx: &Ctx,
     expect_fp: Option<&str>,
 ) -> Result<(SecureChannel<TcpStream>, String)> {
+    let (chan, remote_name, remote_fp) = open(addr, ctx, expect_fp).await?;
+    let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
+    if is_new {
+        let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
+        let msg = format!(
+            "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
+        );
+        println!("{msg}");
+        ctx.emit(Event::Notice { text: msg });
+    }
+    Ok((chan, remote_name))
+}
+
+/// Pede o perfil (recado + foto) de outro computador. Nao confia nele (nada vai
+/// para o known_peers) e o outro lado responde sem pedir aprovacao.
+pub async fn fetch_profile(addr: &str, ctx: &Ctx, fp: &str) -> Result<(String, Vec<u8>)> {
+    let (mut chan, _, _) = open(addr, ctx, Some(fp)).await?;
+    chan.send_control(&Control::ProfileRequest).await?;
+    let (about, len) = match chan.recv().await? {
+        Msg::Control(Control::Profile { about, photo_len }) => (about, photo_len as usize),
+        _ => bail!("resposta inesperada ao pedido de perfil"),
+    };
+    let photo = if len == 0 {
+        Vec::new()
+    } else {
+        match chan.recv().await? {
+            Msg::Chunk { data, .. } if data.len() == len && len <= crate::profile::MAX_PHOTO_BYTES => data,
+            _ => bail!("foto do perfil inválida"),
+        }
+    };
+    graceful_bye(&mut chan).await;
+    Ok((crate::profile::clean_about(&about), photo))
+}
+
+async fn serve_profile(chan: &mut SecureChannel<TcpStream>, ctx: &Ctx) -> Result<()> {
+    let p = ctx.profile.read().unwrap().clone();
+    chan.send_control(&Control::Profile {
+        about: p.about,
+        photo_len: p.photo.len() as u32,
+    })
+    .await?;
+    if !p.photo.is_empty() {
+        chan.send_chunk(&[0u8; 16], 0, &p.photo).await?;
+    }
+    Ok(())
+}
+
+/// TCP + Noise + Hello, com as checagens de identidade; nao grava confianca.
+async fn open(
+    addr: &str,
+    ctx: &Ctx,
+    expect_fp: Option<&str>,
+) -> Result<(SecureChannel<TcpStream>, String, String)> {
     let stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("nao conectei em {addr}"))?;
@@ -144,22 +207,16 @@ pub async fn connect(
     if expect_fp.is_some_and(|fp| fp != remote_fp) {
         bail!("segurança: quem respondeu nesse endereço tem outra chave");
     }
-    let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
-    if is_new {
-        let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
-        let msg = format!(
-            "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
-        );
-        println!("{msg}");
-        ctx.emit(Event::Notice { text: msg });
-    }
-    Ok((chan, remote_name))
+    Ok((chan, remote_name, remote_fp))
 }
 
 /// Conexoes entrantes atendidas ao mesmo tempo; o resto e fechado na hora.
 static CONNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 /// Ate o Hello o par ainda e um estranho: quem nao completa nisso e cortado.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// O primeiro pedido vem logo apos o Hello (o hash do arquivo e feito antes de
+/// conectar); conexao parada alem disso e fechada.
+const FIRST_MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pedidos de "Confiar / Recusar" na tela ao mesmo tempo (contra enxurrada na LAN).
 const MAX_PENDING_APPROVALS: usize = 3;
 
@@ -202,6 +259,19 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
     if remote_fp != chan.remote_fingerprint() {
         bail!("segurança: o par declarou fingerprint diferente do handshake");
     }
+    // o primeiro pedido decide: perfil e publico (responde sem aprovar nem confiar)
+    let Some(first) = tokio::time::timeout(FIRST_MSG_TIMEOUT, chan.recv_opt())
+        .await
+        .context("o par conectou e não pediu nada")??
+    else {
+        return Ok(());
+    };
+    if matches!(first, Msg::Control(Control::ProfileRequest)) {
+        serve_profile(&mut chan, &ctx).await?;
+        // espera o Bye de quem pediu: fechar antes vira RST e a foto se perde
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), chan.recv_opt()).await;
+        return Ok(());
+    }
     let is_new = crate::identity::trust_status(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
     let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
     if is_new {
@@ -217,6 +287,13 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
                     reason: "o outro lado não aceitou a conexão".into(),
                 })
                 .await;
+            // fechar com dado nao lido (a mensagem que ele ja mandou) vira RST no
+            // Windows e o Bye se perde: fecha so a escrita e drena antes de sair
+            let _ = chan.shutdown().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Ok(Some(_)) = chan.recv_opt().await {}
+            })
+            .await;
             println!("conexao com '{remote_name}' recusada");
             ctx.emit(Event::Notice {
                 text: format!("você recusou '{remote_name}'"),
@@ -226,10 +303,14 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
     }
     crate::identity::trust_save(&remote_fp, &remote_name);
 
+    let mut next = Some(first);
     loop {
-        let msg = match chan.recv_opt().await? {
+        let msg = match next.take() {
             Some(m) => m,
-            None => break,
+            None => match chan.recv_opt().await? {
+                Some(m) => m,
+                None => break,
+            },
         };
         match msg {
             Msg::Control(Control::Chat { text }) => {
@@ -269,8 +350,21 @@ pub async fn send_chat(addr: &str, ctx: &Ctx, text: &str, expect_fp: Option<&str
 }
 
 pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path, expect_fp: Option<&str>) -> Result<String> {
+    // hash do arquivo INTEIRO antes de conectar (valida tambem um pedaco retomado).
+    // Em arquivo grande leva segundos: a barra (com Cancelar) ja aparece em 0%,
+    // e o destino nao fica com uma conexao parada esperando
+    let size = tokio::fs::metadata(path).await?.len();
+    if let Some(fp) = expect_fp {
+        ctx.emit(Event::Progress {
+            fp: fp.to_string(),
+            name: file_label(path),
+            done: 0,
+            total: size,
+        });
+    }
+    let sha256 = hash_file(path).await?;
     let (mut chan, remote) = connect(addr, ctx, expect_fp).await?;
-    send_file_over_channel(&mut chan, path, ctx).await?;
+    send_file_over_channel(&mut chan, path, ctx, sha256).await?;
     graceful_bye(&mut chan).await;
     Ok(remote)
 }
@@ -300,34 +394,30 @@ async fn hash_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("arquivo")
+        .to_string()
+}
+
 async fn send_file_over_channel(
     chan: &mut SecureChannel<TcpStream>,
     path: &Path,
     ctx: &Ctx,
+    sha256: String,
 ) -> Result<()> {
+    // a UI mostra o progresso dentro da conversa deste par
+    let peer_fp = chan.remote_fingerprint();
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
         bail!("nao e um arquivo: {}", path.display());
     }
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("arquivo")
-        .to_string();
+    let name = file_label(path);
     let size = meta.len();
     let mut id16 = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut id16);
     let file_id = hex::encode(id16);
-
-    // hash primeiro: o destino recebe o hash do arquivo INTEIRO, o que
-    // permite validar tambem o pedaco retomado de uma tentativa anterior.
-    // Em arquivo grande leva segundos: a barra (com Cancelar) ja aparece em 0%
-    ctx.emit(Event::Progress {
-        name: name.clone(),
-        done: 0,
-        total: size,
-    });
-    let sha256 = hash_file(path).await?;
 
     chan.send_control(&Control::FileOffer {
         file_id: file_id.clone(),
@@ -380,6 +470,7 @@ async fn send_file_over_channel(
             since_progress = 0;
             ctx.emit(Event::Progress {
                 name: name.clone(),
+                fp: peer_fp.clone(),
                 done: sent,
                 total: size,
             });
@@ -387,6 +478,7 @@ async fn send_file_over_channel(
     }
     ctx.emit(Event::Progress {
         name: name.clone(),
+        fp: peer_fp.clone(),
         done: size,
         total: size,
     });
@@ -474,6 +566,7 @@ async fn receive_file(
                 if expected % 16 == 0 {
                     ctx.emit(Event::Progress {
                         name: name.to_string(),
+                        fp: remote_fp.to_string(),
                         done: offset + received,
                         total: size,
                     });
@@ -530,6 +623,7 @@ async fn receive_file(
                 );
                 ctx.emit(Event::Progress {
                     name: name.to_string(),
+                    fp: remote_fp.to_string(),
                     done: size,
                     total: size,
                 });
@@ -618,6 +712,7 @@ mod tests {
             auto_accept: true,
             notify: None,
             approvals: Default::default(),
+            profile: Default::default(),
         })
     }
 
@@ -650,6 +745,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let rx = ctx("rx", &dl);
+        *rx.profile.write().unwrap() = crate::profile::Profile {
+            about: "na sala".into(),
+            photo: vec![0xFF, 0xD8, 1, 2, 3],
+        };
+        let rx_fp = rx.fp();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -657,6 +757,14 @@ mod tests {
             }
         });
         let tx = ctx("tx", &tmp);
+
+        // perfil e publico: busca sem confiar e sem ser confiado (nada no known_peers)
+        let (about, photo) = fetch_profile(&addr, &tx, &rx_fp).await.unwrap();
+        assert_eq!((about.as_str(), photo.as_slice()), ("na sala", &[0xFF, 0xD8, 1, 2, 3][..]));
+        let known = crate::identity::load_trust().peers;
+        assert!(!known.contains_key(&rx_fp) && !known.contains_key(&tx.fp()));
+        // pedir o perfil de quem nao e quem diz ser falha
+        assert!(fetch_profile(&addr, &tx, "outra-chave").await.is_err());
         // a 1a tentativa retoma em cima do lixo e falha no hash; a 2a tem de comecar limpa
         assert!(send_file(&addr, &tx, &src, None).await.is_err());
         send_file(&addr, &tx, &src, None).await.unwrap();

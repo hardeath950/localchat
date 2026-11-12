@@ -24,6 +24,14 @@ pub enum Control {
     },
     /// O destino recebeu (e mostrou) a mensagem de chat.
     ChatAck,
+    /// Pede o perfil (recado + foto). So e mandado a quem anuncia `rev`, entao
+    /// versoes antigas nunca recebem; e respondido sem exigir confianca.
+    ProfileRequest,
+    /// Resposta: a foto (JPEG) vem logo depois num `Chunk` de `photo_len` bytes.
+    Profile {
+        about: String,
+        photo_len: u32,
+    },
     FileOffer {
         file_id: String,
         name: String,
@@ -66,4 +74,8 @@ pub struct Beacon {
     pub port: u16,
     /// Fingerprint da chave estatica (hex).
     pub fp: String,
+    /// Versao do perfil (muda com nome/recado/foto). Versoes antigas nao mandam
+    /// nem leem este campo (serde ignora campo desconhecido).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rev: String,
 }

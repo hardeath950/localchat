@@ -37,10 +37,16 @@ e pergunta se o LocalChat deve abrir junto com o computador.
 
 ## No dia a dia
 
-- **Mensagem:** digite e aperte Enter. "entregue" aparece quando o outro recebeu.
-- **Arquivo:** botão **Arquivo…** ou arraste o arquivo para a janela. Os recebidos ficam
-  na pasta **Downloads/LocalChat** (botão **Abrir pasta**).
-- **Seu nome:** clique em "Você: …" para mudar como os outros te veem.
+- **Mensagem:** digite e aperte Enter (Shift+Enter quebra a linha). ✓✓ aparece quando o
+  outro recebeu. Botão direito numa mensagem copia o texto.
+- **Arquivo:** botão **+** ou arraste para a janela (vários de uma vez). Arquivos grandes
+  mostram a porcentagem e quanto tempo falta; o **✕** cancela. Os recebidos ficam na pasta
+  **Downloads/LocalChat**: clique no arquivo para abrir (botão direito mostra na pasta).
+- **Seu perfil:** clique na sua foto, no topo à esquerda, para mudar nome, recado e foto.
+  Todos os computadores da rede veem o seu perfil.
+- **Dados de um contato:** clique no nome dele no topo da conversa (foto, recado e código
+  de segurança).
+- **Tema claro ou escuro:** menu **⋮ → Tema**.
 - **Fechar no X** deixa o LocalChat rodando para continuar recebendo (no Windows ele fica
   perto do relógio; no Linux, minimizado). Para fechar de vez: **Sair**.
 - **Atualizações:** quando sair versão nova, aparece **"Atualizar agora"** no topo da

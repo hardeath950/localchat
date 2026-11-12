@@ -16,6 +16,8 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 eframe = "0.37.0"
 hex = "0.4"
+# foto do perfil: le PNG/JPEG, recorta e reduz (a mesma versao que o eframe ja usa)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # update automatico: baixa do GitHub Releases (TLS em Rust puro, sem OpenSSL) e
 # so aceita manifesto assinado com a chave minisign do projeto
 minisign-verify = "0.2"
