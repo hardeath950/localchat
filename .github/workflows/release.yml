@@ -98,7 +98,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/LocalChat-Setup-*.exe
+          path: dist/LocalChat-Setup.exe
           if-no-files-found: error
 
   build-linux:
@@ -149,7 +149,7 @@ jobs:
           sudo apt-get install -y -qq minisign
           cd out
           VERSION="${TAG#v}"
-          WIN="LocalChat-Setup-$VERSION.exe"
+          WIN="LocalChat-Setup.exe"
           LIN="localchat-linux-x86_64"
           ls -la
           [ -f "$WIN" ] && [ -f "$LIN" ]
@@ -170,5 +170,5 @@ jobs:
       - name: Anexar ao GitHub Release
         run: |
           cd out
-          gh release upload "$TAG" LocalChat-Setup-*.exe localchat-linux-x86_64 \
+          gh release upload "$TAG" LocalChat-Setup.exe localchat-linux-x86_64 \
             latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig --clobber

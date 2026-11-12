@@ -1,6 +1,6 @@
 ; LocalChat — instalador (Inno Setup 6)
 ; Compilar:  "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" setup.iss
-; Saida:     dist\LocalChat-Setup-0.2.0.exe
+; Saida:     dist\LocalChat-Setup.exe  (use scripts\build-windows.ps1)
 
 #define AppName "LocalChat"
 ; o CI passa /DAppVersion=x.y.z (lido do Cargo.toml)
@@ -17,7 +17,8 @@ DefaultDirName={autopf}\LocalChat
 DefaultGroupName={#AppName}
 PrivilegesRequired=admin
 OutputDir=dist
-OutputBaseFilename=LocalChat-Setup-{#AppVersion}
+; nome fixo: o link "baixar" (releases/latest/download/LocalChat-Setup.exe) nunca muda
+OutputBaseFilename=LocalChat-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

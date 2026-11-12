@@ -1,4 +1,4 @@
-# Build do LocalChat no Windows: binario + instalador (dist\LocalChat-Setup-<versao>.exe).
+# Build do LocalChat no Windows: binario + instalador (dist\LocalChat-Setup.exe).
 # Uso:  powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 # Precisa: Rust (rustup), MSYS2 em C:\msys64 com mingw-w64-x86_64-gcc, Inno Setup 6.
 $ErrorActionPreference = "Stop"
@@ -29,4 +29,4 @@ $iscc = @(
 if (-not $iscc) { throw "Inno Setup 6 nao encontrado (instale de jrsoftware.org)" }
 & $iscc "/DAppVersion=$version" setup.iss
 if ($LASTEXITCODE) { throw "ISCC falhou" }
-Write-Host "Pronto: dist\LocalChat-Setup-$version.exe"
+Write-Host "Pronto: dist\LocalChat-Setup.exe ($version)"
