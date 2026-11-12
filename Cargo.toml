@@ -30,7 +30,9 @@ ureq = "2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.17.2"
-tray-icon = "0.26.1"
+# sem features padrao: a padrao (libappindicator) so serve no Linux e arrastava
+# gtk/glib 0.18 (alerta GHSA-wrw7-89jp-8q8g) para o Cargo.lock
+tray-icon = { version = "0.26.1", default-features = false }
 
 # no Linux o seletor de arquivos usa GTK (o backend xdg-portal e fragil no sync;
 # sem default-features porque o rfd recusa gtk3 + xdg-portal juntos)
