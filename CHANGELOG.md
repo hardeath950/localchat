@@ -2,6 +2,17 @@
 
 As versões novas são escritas pelo release-plz a partir dos commits (`feat:`, `fix:`...).
 
+## [0.2.1](https://github.com/hardeath950/localchat/compare/v0.2.0...v0.2.1) - 2026-11-12
+
+### Added
+
+- instalacao sem compilar - link fixo no Windows e instalador de um comando no Linux
+
+### Fixed
+
+- tira gtk/glib 0.18 do Cargo.lock (alerta GHSA-wrw7-89jp-8q8g)
+- build Windows sem rust-toolchain.toml (rustup novo recusa o host no canal)
+
 ## [0.2.0]
 
 ### Novo
