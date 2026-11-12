@@ -221,8 +221,7 @@ async fn open(
 static CONNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 /// Ate o Hello o par ainda e um estranho: quem nao completa nisso e cortado.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// O primeiro pedido vem logo apos o Hello (o hash do arquivo e feito antes de
-/// conectar); conexao parada alem disso e fechada.
+/// O primeiro pedido vem logo apos o Hello; conexao parada alem disso e fechada.
 const FIRST_MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pedidos de "Confiar / Recusar" na tela ao mesmo tempo (contra enxurrada na LAN).
 const MAX_PENDING_APPROVALS: usize = 3;
@@ -382,8 +381,7 @@ async fn serve_share(
         Err(e) => return chan.send_control(&Control::Bye { reason: e.to_string() }).await,
     };
     if get {
-        let sha256 = hash_file(&real).await?;
-        return send_file_over_channel(chan, &real, ctx, sha256, false).await;
+        return send_file_over_channel(chan, &real, ctx, false).await;
     }
     chan.send_control(&Control::ShareListing {
         name: share.name(),
@@ -454,9 +452,7 @@ pub async fn send_chat(addr: &str, ctx: &Ctx, text: &str, expect_fp: Option<&str
 }
 
 pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path, expect_fp: Option<&str>) -> Result<String> {
-    // hash do arquivo INTEIRO antes de conectar (valida tambem um pedaco retomado).
-    // Em arquivo grande leva segundos: a barra (com Cancelar) ja aparece em 0%,
-    // e o destino nao fica com uma conexao parada esperando
+    // a barra (com Cancelar) ja aparece em 0% enquanto conecta e o destino aprova
     let size = tokio::fs::metadata(path).await?.len();
     if let Some(fp) = expect_fp {
         ctx.emit(Event::Progress {
@@ -466,9 +462,8 @@ pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path, expect_fp: Option<&st
             total: size,
         });
     }
-    let sha256 = hash_file(path).await?;
     let (mut chan, remote) = connect(addr, ctx, expect_fp).await?;
-    send_file_over_channel(&mut chan, path, ctx, sha256, true).await?;
+    send_file_over_channel(&mut chan, path, ctx, true).await?;
     graceful_bye(&mut chan).await;
     Ok(remote)
 }
@@ -483,19 +478,25 @@ async fn graceful_bye(chan: &mut SecureChannel<TcpStream>) {
     let _ = chan.shutdown().await;
 }
 
-/// SHA-256 de um arquivo (leitura em streaming).
-async fn hash_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+/// Leitura e gravacao do arquivo em blocos deste tamanho: cada acesso ao disco
+/// do tokio e uma ida a outra thread, cara demais para fazer a cada chunk de 32 KB.
+const FILE_BUF: usize = 1 << 20;
+
+/// Soma ao hash os proximos `n` bytes de `file`: numa retomada, o trecho que
+/// ja foi transferido. O resto entra no hash durante a propria transferencia
+/// (o arquivo e lido uma vez so, sem passada separada antes nem depois).
+async fn hash_prefix(file: &mut File, mut n: u64, hasher: &mut Sha256) -> Result<()> {
+    let mut buf = vec![0u8; FILE_BUF];
+    while n > 0 {
+        let want = n.min(buf.len() as u64) as usize;
+        let got = file.read(&mut buf[..want]).await?;
+        if got == 0 {
+            bail!("arquivo menor que o esperado");
         }
-        hasher.update(&buf[..n]);
+        hasher.update(&buf[..got]);
+        n -= got as u64;
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(())
 }
 
 fn file_label(path: &Path) -> String {
@@ -509,7 +510,6 @@ async fn send_file_over_channel(
     chan: &mut SecureChannel<TcpStream>,
     path: &Path,
     ctx: &Ctx,
-    sha256: String,
     // false = download de pasta compartilhada: quem serve nao ve barra nem aviso
     show: bool,
 ) -> Result<()> {
@@ -555,9 +555,11 @@ async fn send_file_over_channel(
     };
 
     let mut file = File::open(path).await?;
+    // ler o trecho ja enviado tambem deixa o arquivo posicionado em `offset`
+    let mut hasher = Sha256::new();
+    hash_prefix(&mut file, offset, &mut hasher).await?;
+    let mut file = tokio::io::BufReader::with_capacity(FILE_BUF, file);
     if offset > 0 {
-        use tokio::io::{AsyncSeekExt, SeekFrom};
-        file.seek(SeekFrom::Start(offset)).await?;
         let pct = offset * 100 / size.max(1);
         let msg = format!("retomando envio de '{name}' a partir de {pct}%");
         println!("{msg}");
@@ -573,6 +575,7 @@ async fn send_file_over_channel(
         if n == 0 {
             break;
         }
+        hasher.update(&buf[..n]);
         chan.send_chunk(&id16, seq, &buf[..n]).await?;
         seq += 1;
         sent += n as u64;
@@ -595,7 +598,7 @@ async fn send_file_over_channel(
     });
     chan.send_control(&Control::FileDone {
         file_id: file_id.clone(),
-        sha256,
+        sha256: hex::encode(hasher.finalize()),
     })
     .await?;
     match chan.recv().await? {
@@ -652,12 +655,17 @@ async fn receive_file(
     // anterior e sai, senao um .part velho corrompe todas as proximas tentativas
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
         .open(&part_path)
         .await
         .with_context(|| format!("abrir {}", part_path.display()))?;
     file.set_len(offset).await?;
+    // o hash e do arquivo COMPLETO: o trecho retomado entra agora, o resto ao chegar
+    let mut hasher = Sha256::new();
+    hash_prefix(&mut file, offset, &mut hasher).await?;
     tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset)).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(FILE_BUF, file);
     let mut received: u64 = 0;
     let mut expected: u32 = (offset / CHUNK_SIZE as u64) as u32;
     let want_id = hex::decode(file_id).unwrap_or_default();
@@ -671,6 +679,7 @@ async fn receive_file(
                 if seq != expected {
                     bail!("ordem de chunk quebrada: {seq} != {expected}");
                 }
+                hasher.update(&data);
                 file.write_all(&data).await?;
                 received += data.len() as u64;
                 expected += 1;
@@ -705,8 +714,7 @@ async fn receive_file(
                     .await?;
                     bail!(note);
                 }
-                // hash do arquivo COMPLETO (inclui o pedaco retomado)
-                let got = hash_file(&part_path).await?;
+                let got = hex::encode(hasher.finalize());
                 if got != sha256 {
                     let _ = tokio::fs::remove_file(&part_path).await;
                     let note = format!("integridade falhou: sha256 {got} != {sha256}");
@@ -883,6 +891,13 @@ mod tests {
         send_chat(&addr, &tx, "oi", None).await.unwrap();
         assert!(send_chat(&addr, &tx, "oi", Some("outra-chave")).await.is_err());
         assert_eq!(std::fs::read(dl.join("a.bin")).unwrap(), data);
+        // retomada de verdade: um .part com o comeco certo e completado (o hash
+        // do trecho que ja estava no disco tem de bater dos dois lados)
+        let src2 = tmp.join("b.bin");
+        std::fs::write(&src2, &data).unwrap();
+        std::fs::write(dl.join("b.bin.part"), &data[..70_000]).unwrap();
+        send_file(&addr, &tx, &src2, None).await.unwrap();
+        assert_eq!(std::fs::read(dl.join("b.bin")).unwrap(), data);
 
         // pasta compartilhada: so para quem ela foi aberta, so dentro dela, so no prazo
         let shared = tmp.join("pasta");
