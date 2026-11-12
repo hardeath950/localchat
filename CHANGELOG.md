@@ -2,6 +2,12 @@
 
 As versões novas são escritas pelo release-plz a partir dos commits (`feat:`, `fix:`...).
 
+## [0.2.2](https://github.com/hardeath950/localchat/compare/v0.2.1...v0.2.2) - 2026-11-12
+
+### Added
+
+- visual estilo WhatsApp Web, perfil com foto e recado, progresso de arquivos grandes
+
 ## [0.2.1](https://github.com/hardeath950/localchat/compare/v0.2.0...v0.2.1) - 2026-11-12
 
 ### Added
