@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 1;
+/// v2: o destino confirma cada mensagem de chat com `ChatAck`.
+pub const PROTO_VERSION: u32 = 2;
 /// Porta UDP de descoberta (broadcast na LAN).
 pub const DISCOVERY_PORT: u16 = 47820;
 /// Limite de mensagem do Noise (65535 bytes de plaintext).
@@ -21,6 +22,8 @@ pub enum Control {
     Chat {
         text: String,
     },
+    /// O destino recebeu (e mostrou) a mensagem de chat.
+    ChatAck,
     FileOffer {
         file_id: String,
         name: String,
@@ -56,7 +59,7 @@ pub enum Control {
 pub struct Beacon {
     pub app: String,
     pub v: u32,
-    /// "announce" | "query" | "answer"
+    /// "announce" | "query" | "answer" | "show" (so de 127.0.0.1: mostra a janela)
     pub kind: String,
     pub name: String,
     /// Porta TCP do app.

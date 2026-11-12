@@ -14,8 +14,10 @@ use tokio::net::TcpStream;
 /// Eventos que saem das conexoes para consumo da interface.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Chat { from: String, text: String },
-    FileReceived { from: String, path: String, size: u64 },
+    Chat { from: String, fp: String, text: String },
+    FileReceived { from: String, fp: String, path: String, size: u64 },
+    /// Resultado de um envio iniciado pela UI (`err` = por que nao foi entregue).
+    Sent { id: u64, err: Option<String> },
     Notice { text: String },
     /// Par novo pedindo conexao: a UI responde com Confiar/Recusar.
     ApprovalRequest { id: u64, name: String, code: String },
@@ -25,6 +27,10 @@ pub enum Event {
     GuiShow,
     /// Menu "Sair" da bandeja.
     GuiQuit,
+    /// Ha versao nova publicada (manifesto ja verificado).
+    UpdateAvailable(crate::update::Manifest),
+    /// O download/instalacao do update falhou.
+    UpdateFailed(String),
 }
 
 /// Fila de aprovacoes pendentes: a UI decide "Confiar / Recusar" cada par novo.
@@ -49,7 +55,8 @@ impl ApprovalGate {
 }
 
 pub struct Ctx {
-    pub name: String,
+    /// Trocavel em tempo de execucao (renomear na GUI).
+    pub name: std::sync::RwLock<String>,
     pub private: Vec<u8>,
     pub public: Vec<u8>,
     pub download_dir: PathBuf,
@@ -61,6 +68,10 @@ pub struct Ctx {
 impl Ctx {
     pub fn fp(&self) -> String {
         fingerprint(&self.public)
+    }
+
+    pub fn name(&self) -> String {
+        self.name.read().unwrap().clone()
     }
 
     pub fn emit(&self, ev: Event) {
@@ -75,6 +86,9 @@ impl Ctx {
         let Some(tx) = &self.notify else {
             return true;
         };
+        if self.approvals.pending.lock().unwrap().len() >= MAX_PENDING_APPROVALS {
+            return false;
+        }
         let (otx, orx) = tokio::sync::oneshot::channel();
         let id = self.approvals.open(otx);
         let _ = tx.send(Event::ApprovalRequest {
@@ -97,30 +111,44 @@ impl Ctx {
 }
 
 /// Conecta, faz o handshake e troca o Hello (com verificacao de identidade + TOFU).
-pub async fn connect(addr: &str, ctx: &Ctx) -> Result<(SecureChannel<TcpStream>, String)> {
+/// `expect_fp`: a chave que a UI mostrou para este par; outra chave no mesmo
+/// endereco e recusada (senao a mensagem iria para a conversa errada).
+pub async fn connect(
+    addr: &str,
+    ctx: &Ctx,
+    expect_fp: Option<&str>,
+) -> Result<(SecureChannel<TcpStream>, String)> {
     let stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("nao conectei em {addr}"))?;
     stream.set_nodelay(true)?;
     let mut chan = SecureChannel::initiator(stream, &ctx.private).await?;
     chan.send_control(&Control::Hello {
-        name: ctx.name.clone(),
+        name: ctx.name(),
         fingerprint: ctx.fp(),
         version: crate::protocol::PROTO_VERSION,
     })
     .await?;
     let (remote_name, remote_fp) = match chan.recv().await? {
-        Msg::Control(Control::Hello { name, fingerprint, .. }) => (name, fingerprint),
+        Msg::Control(Control::Hello { name, fingerprint, version }) => {
+            if version != crate::protocol::PROTO_VERSION {
+                bail!("o outro computador usa outra versão do LocalChat (atualize os dois)");
+            }
+            (name, fingerprint)
+        }
         _ => bail!("esperava Hello do par"),
     };
     if remote_fp != chan.remote_fingerprint() {
-        bail!("seguranca: o par declarou fingerprint diferente do handshake");
+        bail!("segurança: o par declarou fingerprint diferente do handshake");
+    }
+    if expect_fp.is_some_and(|fp| fp != remote_fp) {
+        bail!("segurança: quem respondeu nesse endereço tem outra chave");
     }
     let is_new = trust_check(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
     if is_new {
         let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
         let msg = format!(
-            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com o outro aparelho)"
+            "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
         );
         println!("{msg}");
         ctx.emit(Event::Notice { text: msg });
@@ -128,28 +156,57 @@ pub async fn connect(addr: &str, ctx: &Ctx) -> Result<(SecureChannel<TcpStream>,
     Ok((chan, remote_name))
 }
 
+/// Conexoes entrantes atendidas ao mesmo tempo; o resto e fechado na hora.
+static CONNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+/// Ate o Hello o par ainda e um estranho: quem nao completa nisso e cortado.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Pedidos de "Confiar / Recusar" na tela ao mesmo tempo (contra enxurrada na LAN).
+const MAX_PENDING_APPROVALS: usize = 3;
+
+/// Nome que aparece na tela: curto e sem caracteres de controle.
+pub fn valid_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control)
+}
+
 /// Lado servidor: atende uma conexao entrante (chat + recebimento de arquivos).
 pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<()> {
-    stream.set_nodelay(true)?;
-    let mut chan = SecureChannel::responder(stream, &ctx.private).await?;
-    chan.send_control(&Control::Hello {
-        name: ctx.name.clone(),
-        fingerprint: ctx.fp(),
-        version: crate::protocol::PROTO_VERSION,
-    })
-    .await?;
-    let (remote_name, remote_fp) = match chan.recv().await? {
-        Msg::Control(Control::Hello { name, fingerprint, .. }) => (name, fingerprint),
-        _ => bail!("esperava Hello do par"),
+    let Ok(_permit) = CONNS.try_acquire() else {
+        return Ok(()); // lotado: derruba sem gastar handshake
     };
+    stream.set_nodelay(true)?;
+    let hello = async {
+        let mut chan = SecureChannel::responder(stream, &ctx.private).await?;
+        chan.send_control(&Control::Hello {
+            name: ctx.name(),
+            fingerprint: ctx.fp(),
+            version: crate::protocol::PROTO_VERSION,
+        })
+        .await?;
+        let (name, fp) = match chan.recv().await? {
+            Msg::Control(Control::Hello { name, fingerprint, version }) => {
+                if version != crate::protocol::PROTO_VERSION {
+                    bail!("o outro computador usa outra versão do LocalChat (atualize os dois)");
+                }
+                (name, fingerprint)
+            }
+            _ => bail!("esperava Hello do par"),
+        };
+        anyhow::Ok((chan, name, fp))
+    };
+    let (mut chan, remote_name, remote_fp) = tokio::time::timeout(HANDSHAKE_TIMEOUT, hello)
+        .await
+        .context("o par demorou demais para se apresentar")??;
+    if !valid_name(&remote_name) {
+        bail!("nome do par inválido");
+    }
     if remote_fp != chan.remote_fingerprint() {
-        bail!("seguranca: o par declarou fingerprint diferente do handshake");
+        bail!("segurança: o par declarou fingerprint diferente do handshake");
     }
     let is_new = crate::identity::trust_status(&remote_fp, &remote_name).map_err(anyhow::Error::msg)?;
     let code = crate::identity::pairing_code(&ctx.fp(), &remote_fp);
     if is_new {
         let msg = format!(
-            "primeiro contato com '{remote_name}' — codigo de pareamento: {code} (confira com o outro aparelho)"
+            "primeiro contato com '{remote_name}' — código de pareamento: {code} (confira com o outro aparelho)"
         );
         println!("{msg}");
         ctx.emit(Event::Notice { text: msg });
@@ -157,12 +214,12 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
         if !ctx.request_approval(&remote_name, &code).await {
             let _ = chan
                 .send_control(&Control::Bye {
-                    reason: "par nao confiado".into(),
+                    reason: "o outro lado não aceitou a conexão".into(),
                 })
                 .await;
             println!("conexao com '{remote_name}' recusada");
             ctx.emit(Event::Notice {
-                text: format!("voce recusou o par '{remote_name}'"),
+                text: format!("você recusou '{remote_name}'"),
             });
             return Ok(());
         }
@@ -179,11 +236,14 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
                 println!("[{}] {}", remote_name, text);
                 ctx.emit(Event::Chat {
                     from: remote_name.clone(),
+                    fp: remote_fp.clone(),
                     text,
                 });
+                chan.send_control(&Control::ChatAck).await?;
             }
             Msg::Control(Control::FileOffer { file_id, name, size }) => {
-                receive_file(&mut chan, &file_id, &name, size, &ctx, &remote_name).await?;
+                receive_file(&mut chan, &file_id, &name, size, &ctx, &remote_name, &remote_fp)
+                    .await?;
             }
             Msg::Control(Control::Bye { .. }) => break,
             Msg::Control(_) => {}
@@ -193,16 +253,23 @@ pub async fn handle_conn(stream: TcpStream, ctx: std::sync::Arc<Ctx>) -> Result<
     Ok(())
 }
 
-pub async fn send_chat(addr: &str, ctx: &Ctx, text: &str) -> Result<String> {
-    let (mut chan, remote) = connect(addr, ctx).await?;
+/// Envia uma mensagem e espera a confirmacao do destino. Se ele ainda nao
+/// confia em nos, isso espera o "Confiar / Recusar" de la (ate 5 min).
+pub async fn send_chat(addr: &str, ctx: &Ctx, text: &str, expect_fp: Option<&str>) -> Result<String> {
+    let (mut chan, remote) = connect(addr, ctx, expect_fp).await?;
     chan.send_control(&Control::Chat { text: text.to_string() })
         .await?;
+    match chan.recv().await? {
+        Msg::Control(Control::ChatAck) => {}
+        Msg::Control(Control::Bye { reason }) => bail!("{reason}"),
+        _ => bail!("resposta inesperada do par"),
+    }
     graceful_bye(&mut chan).await;
     Ok(remote)
 }
 
-pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path) -> Result<String> {
-    let (mut chan, remote) = connect(addr, ctx).await?;
+pub async fn send_file(addr: &str, ctx: &Ctx, path: &Path, expect_fp: Option<&str>) -> Result<String> {
+    let (mut chan, remote) = connect(addr, ctx, expect_fp).await?;
     send_file_over_channel(&mut chan, path, ctx).await?;
     graceful_bye(&mut chan).await;
     Ok(remote)
@@ -253,7 +320,13 @@ async fn send_file_over_channel(
     let file_id = hex::encode(id16);
 
     // hash primeiro: o destino recebe o hash do arquivo INTEIRO, o que
-    // permite validar tambem o pedaco retomado de uma tentativa anterior
+    // permite validar tambem o pedaco retomado de uma tentativa anterior.
+    // Em arquivo grande leva segundos: a barra (com Cancelar) ja aparece em 0%
+    ctx.emit(Event::Progress {
+        name: name.clone(),
+        done: 0,
+        total: size,
+    });
     let sha256 = hash_file(path).await?;
 
     chan.send_control(&Control::FileOffer {
@@ -276,6 +349,7 @@ async fn send_file_over_channel(
             offset
         }
         Msg::Control(Control::FileReject { reason, .. }) => bail!("recusado pelo par: {reason}"),
+        Msg::Control(Control::Bye { reason }) => bail!("{reason}"),
         _ => bail!("resposta inesperada ao FileOffer"),
     };
 
@@ -338,6 +412,7 @@ async fn receive_file(
     size: u64,
     ctx: &Ctx,
     remote: &str,
+    remote_fp: &str,
 ) -> Result<()> {
     if !ctx.auto_accept {
         chan.send_control(&Control::FileReject {
@@ -357,12 +432,6 @@ async fn receive_file(
         let s = meta.len();
         if s > 0 && s < size {
             offset = s - (s % CHUNK_SIZE as u64);
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&part_path)
-                .await?
-                .set_len(offset)
-                .await?;
             let pct = offset * 100 / size.max(1);
             let msg = format!("retomando recebimento de '{name}' a partir de {pct}%");
             println!("[{remote}] {msg}");
@@ -376,12 +445,16 @@ async fn receive_file(
     })
     .await?;
 
+    // write + set_len (nao append): tudo alem do offset e sobra de tentativa
+    // anterior e sai, senao um .part velho corrompe todas as proximas tentativas
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
         .open(&part_path)
         .await
         .with_context(|| format!("abrir {}", part_path.display()))?;
+    file.set_len(offset).await?;
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(offset)).await?;
     let mut received: u64 = 0;
     let mut expected: u32 = (offset / CHUNK_SIZE as u64) as u32;
     let want_id = hex::decode(file_id).unwrap_or_default();
@@ -413,6 +486,8 @@ async fn receive_file(
                 file.flush().await?;
                 drop(file);
                 if offset + received != size {
+                    // .part invalido nao serve para retomar: a proxima tentativa comeca do zero
+                    let _ = tokio::fs::remove_file(&part_path).await;
                     let note = format!(
                         "integridade falhou: {}/{} bytes recebidos",
                         offset + received,
@@ -429,6 +504,7 @@ async fn receive_file(
                 // hash do arquivo COMPLETO (inclui o pedaco retomado)
                 let got = hash_file(&part_path).await?;
                 if got != sha256 {
+                    let _ = tokio::fs::remove_file(&part_path).await;
                     let note = format!("integridade falhou: sha256 {got} != {sha256}");
                     chan.send_control(&Control::FileAck {
                         file_id: fid,
@@ -452,8 +528,14 @@ async fn receive_file(
                     path.display(),
                     size
                 );
+                ctx.emit(Event::Progress {
+                    name: name.to_string(),
+                    done: size,
+                    total: size,
+                });
                 ctx.emit(Event::FileReceived {
                     from: remote.to_string(),
+                    fp: remote_fp.to_string(),
                     path: path.display().to_string(),
                     size,
                 });
@@ -478,10 +560,20 @@ fn sanitize(name: &str) -> String {
         .unwrap_or("arquivo");
     let cleaned: String = base
         .chars()
-        .map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c })
         .collect();
+    // Windows ignora ponto/espaco no fim e trata CON, NUL, COM1... (com qualquer
+    // extensao) como dispositivo, nao arquivo
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
+    let stem = cleaned.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
     if cleaned.trim().is_empty() {
         "arquivo".into()
+    } else if reserved {
+        format!("_{cleaned}")
     } else {
         cleaned
     }
@@ -508,4 +600,70 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
         }
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(name: &str, dir: &Path) -> Arc<Ctx> {
+        let kp = snow::Builder::new(crate::identity::NOISE_PARAMS.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        Arc::new(Ctx {
+            name: std::sync::RwLock::new(name.into()),
+            private: kp.private,
+            public: kp.public,
+            download_dir: dir.into(),
+            auto_accept: true,
+            notify: None,
+            approvals: Default::default(),
+        })
+    }
+
+    #[test]
+    fn nomes_de_arquivo_seguros() {
+        assert_eq!(sanitize("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize(r"..\..\Windows\win.ini"), if cfg!(windows) { "win.ini" } else { ".._.._Windows_win.ini" });
+        assert_eq!(sanitize("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize("com1"), "_com1");
+        assert_eq!(sanitize("console.txt"), "console.txt");
+        assert_eq!(sanitize("foto. "), "foto");
+        assert_eq!(sanitize("a\nb\0.txt"), "a_b_.txt");
+        assert_eq!(sanitize(".."), "arquivo");
+        assert!(valid_name("Ana (notebook)"));
+        assert!(!valid_name("x\ny") && !valid_name(&"a".repeat(65)) && !valid_name("  "));
+    }
+
+    /// Um .part velho de OUTRO arquivo com o mesmo nome nao pode travar o nome para sempre.
+    #[tokio::test]
+    async fn part_velho_nao_envenena_o_nome() {
+        let tmp = std::env::temp_dir().join(format!("localchat-test-{}", std::process::id()));
+        let dl = tmp.join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::env::set_var("LOCALCHAT_HOME", &tmp);
+        let src = tmp.join("a.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        std::fs::write(dl.join("a.bin.part"), vec![7u8; 70_000]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let rx = ctx("rx", &dl);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(handle_conn(stream, rx.clone()));
+            }
+        });
+        let tx = ctx("tx", &tmp);
+        // a 1a tentativa retoma em cima do lixo e falha no hash; a 2a tem de comecar limpa
+        assert!(send_file(&addr, &tx, &src, None).await.is_err());
+        send_file(&addr, &tx, &src, None).await.unwrap();
+        // mensagem so conta como entregue com a confirmacao do destino
+        send_chat(&addr, &tx, "oi", None).await.unwrap();
+        assert!(send_chat(&addr, &tx, "oi", Some("outra-chave")).await.is_err());
+        assert_eq!(std::fs::read(dl.join("a.bin")).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

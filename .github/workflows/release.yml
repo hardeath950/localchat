@@ -1,0 +1,177 @@
+# Publicacao de versoes.
+#
+# 1. A cada push na main, o release-plz abre (ou atualiza) um PR "release" com a
+#    versao nova no Cargo.toml e o CHANGELOG gerado pelos commits (feat:, fix:...).
+# 2. Ao fazer merge desse PR, o release-plz cria a tag vX.Y.Z e o GitHub Release.
+# 3. No mesmo workflow (tag criada com GITHUB_TOKEN nao dispara outro workflow):
+#    build Windows (instalador) e Linux, SHA256SUMS e latest.json assinado com a
+#    chave minisign (secret MINISIGN_SECRET_KEY). O app so aceita esse manifesto.
+#
+# Para refazer os arquivos de uma tag existente: Actions > Release > Run workflow.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag existente para (re)gerar os arquivos, ex.: v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      # o rust-toolchain.toml fixa o toolchain do Windows; no Linux vale o stable nativo
+      RUSTUP_TOOLCHAIN: stable
+    outputs:
+      tag: ${{ steps.info.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Criar tag e GitHub Release (se a versao do Cargo.toml ainda nao saiu)
+        id: release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Abrir/atualizar o PR da proxima versao
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: info
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: echo "tag=$(echo "$RELEASES" | jq -r '.[0].tag')" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: [release-plz]
+    if: always() && (needs.release-plz.outputs.tag != '' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        env:
+          TAG: ${{ needs.release-plz.outputs.tag || inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag invalida: $TAG"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: [plan]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+      - name: gcc do MSYS2 (linker e C do ring), no C:\msys64 que o .cargo/config.toml usa
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          release: false
+          install: mingw-w64-x86_64-gcc
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build, testes e instalador
+        shell: pwsh
+        run: |
+          rustup toolchain install   # o do rust-toolchain.toml (stable windows-gnu)
+          ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/LocalChat-Setup-*.exe
+          if-no-files-found: error
+
+  build-linux:
+    needs: [plan]
+    runs-on: ubuntu-latest
+    # Ubuntu 20.04 = glibc 2.31: o binario roda no Zorin 16 (20.04) e no 17 (22.04)
+    container: ubuntu:20.04
+    steps:
+      - name: Ferramentas basicas do container
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo git ca-certificates curl
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+      - name: Build e testes
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          bash scripts/build-linux.sh
+          . "$HOME/.cargo/env"
+          cargo test --release --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/localchat localchat-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: localchat-linux-x86_64
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build-windows, build-linux]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Manifesto, checksums e assinatura
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "falta o secret MINISIGN_SECRET_KEY"; exit 1; }
+          sudo apt-get install -y -qq minisign
+          cd out
+          VERSION="${TAG#v}"
+          WIN="LocalChat-Setup-$VERSION.exe"
+          LIN="localchat-linux-x86_64"
+          ls -la
+          [ -f "$WIN" ] && [ -f "$LIN" ]
+          BASE="https://github.com/$GH_REPO/releases/download/$TAG"
+          NOTES="$(gh release view "$TAG" --json body -q .body | head -c 4000)"
+          jq -n --arg v "$VERSION" --arg notes "$NOTES" \
+            --arg wu "$BASE/$WIN" --arg ws "$(sha256sum "$WIN" | cut -d' ' -f1)" \
+            --arg lu "$BASE/$LIN" --arg ls "$(sha256sum "$LIN" | cut -d' ' -f1)" \
+            '{version: $v, notes: $notes, windows: {url: $wu, sha256: $ws}, linux: {url: $lu, sha256: $ls}}' \
+            > latest.json
+          cat latest.json
+          sha256sum "$WIN" "$LIN" latest.json > SHA256SUMS
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m latest.json -t "localchat $VERSION"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m SHA256SUMS -t "localchat $VERSION"
+          rm -f "$RUNNER_TEMP/minisign.key"
+      - name: Anexar ao GitHub Release
+        run: |
+          cd out
+          gh release upload "$TAG" LocalChat-Setup-*.exe localchat-linux-x86_64 \
+            latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig --clobber

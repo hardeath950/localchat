@@ -63,6 +63,12 @@ fn now() -> u64 {
 pub fn load_or_init(name: Option<String>) -> Result<(Identity, Vec<u8>, Vec<u8>)> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("criar {}", dir.display()))?;
+    // a chave privada e o historico ficam aqui: so o dono le (vale para instalacoes antigas)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let path = dir.join("identity.json");
     if path.exists() {
         let id: Identity = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
@@ -83,11 +89,24 @@ pub fn load_or_init(name: Option<String>) -> Result<(Identity, Vec<u8>, Vec<u8>)
     Ok((id, kp.private, kp.public))
 }
 
+/// Nome da maquina, nao do usuario: o mesmo usuario em dois PCs daria nomes iguais.
 fn default_name() -> String {
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "eu".into())
-        .to_lowercase()
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "eu".into())
+}
+
+/// Troca o nome mostrado aos outros (a chave, e portanto a confianca, nao muda).
+pub fn rename(new_name: &str) -> Result<()> {
+    let path = config_dir().join("identity.json");
+    let mut id: Identity = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    id.name = new_name.to_string();
+    std::fs::write(&path, serde_json::to_string_pretty(&id)?)?;
+    Ok(())
 }
 
 pub fn trust_path() -> PathBuf {

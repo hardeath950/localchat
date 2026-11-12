@@ -1,0 +1,3 @@
+# scripts de shell quebram com CRLF quando a pasta vai do Windows para o Linux
+*.sh text eol=lf
+*.minisig -text

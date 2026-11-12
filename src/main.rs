@@ -4,6 +4,7 @@ mod gui;
 mod identity;
 mod protocol;
 mod session;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -142,7 +143,7 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
             let ctx = one_shot_ctx()?;
             let addr = resolve_alvo(&alvo, None).await?;
             let text = texto.join(" ");
-            match session::send_chat(&addr, &ctx, &text).await {
+            match session::send_chat(&addr, &ctx, &text, None).await {
                 Ok(name) => {
                     println!("mensagem enviada para {name}");
                     Ok(())
@@ -153,7 +154,7 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
         Cmd::Send { alvo, arquivo } => {
             let ctx = one_shot_ctx()?;
             let addr = resolve_alvo(&alvo, None).await?;
-            let name = session::send_file(&addr, &ctx, &arquivo).await?;
+            let name = session::send_file(&addr, &ctx, &arquivo, None).await?;
             println!("arquivo entregue para {name}");
             Ok(())
         }
@@ -170,7 +171,7 @@ async fn run_cmd(cmd: Cmd) -> Result<()> {
 fn one_shot_ctx() -> Result<Ctx> {
     let (id, private, public) = load_or_init(None)?;
     Ok(Ctx {
-        name: id.name,
+        name: std::sync::RwLock::new(id.name),
         private,
         public,
         download_dir: PathBuf::new(),
@@ -192,7 +193,7 @@ async fn run_serve(
     let download_dir = download_dir.unwrap_or_else(default_download_dir);
     std::fs::create_dir_all(&download_dir)?;
     let ctx = Arc::new(Ctx {
-        name: id.name.clone(),
+        name: std::sync::RwLock::new(id.name.clone()),
         private,
         public,
         download_dir: download_dir.clone(),
@@ -205,19 +206,8 @@ async fn run_serve(
 
     if !no_discovery {
         let udp = Arc::new(discovery::bind_udp(protocol::DISCOVERY_PORT)?);
-        tokio::spawn(discovery::announce_loop(
-            udp.clone(),
-            id.name.clone(),
-            addr.port(),
-            fp.clone(),
-        ));
-        tokio::spawn(discovery::listen_loop(
-            udp,
-            table.clone(),
-            fp.clone(),
-            id.name.clone(),
-            addr.port(),
-        ));
+        tokio::spawn(discovery::announce_loop(udp.clone(), ctx.clone(), addr.port()));
+        tokio::spawn(discovery::listen_loop(udp, table.clone(), ctx.clone(), addr.port()));
     }
 
     let listener = TcpListener::bind(addr)
@@ -277,7 +267,7 @@ async fn run_serve(
                     }
                 };
                 match resolve_alvo(&alvo, Some(&table)).await {
-                    Ok(addr) => match session::send_chat(&addr, &ctx, &texto).await {
+                    Ok(addr) => match session::send_chat(&addr, &ctx, &texto, None).await {
                         Ok(name) => println!("mensagem enviada para {name}"),
                         Err(e) => println!("falha: {e:#}"),
                     },
@@ -293,7 +283,7 @@ async fn run_serve(
                     }
                 };
                 match resolve_alvo(&alvo, Some(&table)).await {
-                    Ok(addr) => match session::send_file(&addr, &ctx, PathBuf::from(&caminho).as_path()).await
+                    Ok(addr) => match session::send_file(&addr, &ctx, PathBuf::from(&caminho).as_path(), None).await
                     {
                         Ok(name) => println!("arquivo entregue para {name}"),
                         Err(e) => println!("falha: {e:#}"),
@@ -319,12 +309,11 @@ fn print_help() {
 }
 
 fn print_peers(table: &PeerTable, fp: &str) {
-    let t = table.lock().unwrap();
-    if t.is_empty() {
-        println!("Nenhum par descoberto ainda (aguarde ums ou confira o firewall).");
+    let mut v = discovery::online(table);
+    if v.is_empty() {
+        println!("Nenhum par na rede agora (aguarde uns segundos ou confira o firewall).");
         return;
     }
-    let mut v: Vec<_> = t.values().collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     for p in v {
         println!(
@@ -340,13 +329,10 @@ fn print_peers(table: &PeerTable, fp: &str) {
 /// Resolve o alvo: nome conhecido na tabela, "ip:porta" direto ou nome via varredura.
 async fn resolve_alvo(target: &str, table: Option<&PeerTable>) -> Result<String> {
     if let Some(t) = table {
-        let hit = {
-            let guard = t.lock().unwrap();
-            guard
-                .values()
-                .find(|p| p.name.eq_ignore_ascii_case(target))
-                .map(|p| format!("{}:{}", p.ip, p.port))
-        };
+        let hit = discovery::online(t)
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(target))
+            .map(|p| format!("{}:{}", p.ip, p.port));
         if let Some(addr) = hit {
             return Ok(addr);
         }
