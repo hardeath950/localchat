@@ -58,6 +58,40 @@ e pergunta se o LocalChat deve abrir junto com o computador.
   janela. Um clique e pronto. Atualize todos os computadores — versões diferentes avisam
   "outra versão do LocalChat" e não conversam.
 
+## Agentes de IA (MCP)
+
+Um agente de IA (Claude Code, Claude Desktop ou outro cliente
+[MCP](https://modelcontextprotocol.io)) pode entrar no chat como **mais um contato na
+rede**, com nome e chave próprios. A sua janela continua funcionando normalmente.
+
+Para conectar no Claude Code:
+
+```bash
+# Windows
+claude mcp add localchat -- "C:\Program Files\LocalChat\localchat.exe" mcp --name assistente
+# Linux
+claude mcp add localchat -- ~/.local/share/localchat/localchat mcp --name assistente
+```
+
+Em outros clientes, configure o comando `localchat` com os argumentos `mcp --name assistente`.
+
+O agente passa a ter quatro ferramentas:
+
+- **peers**: quem está na rede agora.
+- **send_message**: manda uma mensagem para um contato (pelo nome).
+- **send_file**: manda um arquivo.
+- **read_messages**: lê o que chegou para ele (mensagens, arquivos e pedidos de contato).
+
+Para conversar com o agente:
+
+- Peça para ele mandar uma mensagem para você e clique em **Confiar** na sua janela.
+  Depois disso, os dois conversam normalmente.
+- Por segurança, o agente **recusa quem o procura primeiro**. Para ele aceitar qualquer
+  contato, acrescente `--accept-new` ao comando.
+- No Linux com firewall ligado, libere também a porta do agente: `sudo ufw allow 47822/tcp`.
+
+Vários agentes, pastas e cuidados: [DESENVOLVIMENTO.md](DESENVOLVIMENTO.md#agentes-de-ia-mcp).
+
 ## Problemas comuns
 
 **O outro computador não aparece na lista**
